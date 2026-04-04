@@ -4,12 +4,14 @@
   <!-- OPTIONAL PERMISSIONS, REMOVE WHATEVER YOU DO NOT NEED -->
   <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
   <uses-permission android:name="android.permission.VIBRATE"/>
-  <!-- These require runtime permissions on M -->
-  <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
-  <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
-  <!-- END OPTIONAL PERMISSIONS -->
+  <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
 
   <queries>
+    <package android:name="com.whatsapp" />
+    <package android:name="com.whatsapp.w4b" />
+    <provider android:authorities="com.whatsapp.provider.sticker_whitelist_check" />
+    <provider android:authorities="com.whatsapp.w4b.provider.sticker_whitelist_check" />
+
     <!-- Support checking for http(s) links via the Linking API -->
     <intent>
       <action android:name="android.intent.action.VIEW" />
@@ -25,5 +27,14 @@
         <category android:name="android.intent.category.LAUNCHER"/>
       </intent-filter>
     </activity>
+    
+    <provider
+    android:name=".StickerContentProvider"
+    android:authorities="${applicationId}.stickercontentprovider"
+        android:enabled="true"
+        android:exported="true"
+        android:grantUriPermissions="true"
+        android:readPermission="com.whatsapp.sticker.READ" />
+        
   </application>
 </manifest>
