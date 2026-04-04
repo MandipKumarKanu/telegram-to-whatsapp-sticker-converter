@@ -1,7 +1,9 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { Feather } from '@expo/vector-icons';
 import {
   View,
   Text,
+  TextInput,
   StyleSheet,
   FlatList,
   TouchableOpacity,
@@ -23,7 +25,12 @@ const BOT_TOKEN = process.env.EXPO_PUBLIC_TELEGRAM_BOT_TOKEN;
 type RootStackParamList = {
   Home: undefined;
   Preview: { packName: string };
-  Success: undefined;
+  Success: {
+    sentPackCount?: number;
+    exportedStickerCount?: number;
+    packDisplayName?: string;
+    coverUrl?: string;
+  };
 };
 
 type PreviewRouteProp = RouteProp<RootStackParamList, 'Preview'>;
@@ -91,6 +98,10 @@ export default function PreviewScreen() {
   );
   const [animationNoticeShown, setAnimationNoticeShown] = useState(false);
 
+  const [customPackName, setCustomPackName] = useState('');
+  const [selectedStickerKeysByChunk, setSelectedStickerKeysByChunk] = useState<Record<number, string[]>>({});
+
+
   useEffect(() => {
     fetchPackData();
   }, []);
@@ -154,6 +165,42 @@ export default function PreviewScreen() {
     [stickerChunks]
   );
 
+  
+  const selectedChunkKeySet = useMemo(() => {
+    return new Set(selectedStickerKeysByChunk[selectedChunkIndex] || []);
+  }, [selectedStickerKeysByChunk, selectedChunkIndex]);
+
+  const selectedChunkStickers = useMemo(() => {
+    const chunk = stickerChunks[selectedChunkIndex] || [];
+    return chunk.filter(s => selectedChunkKeySet.has(s.key));
+  }, [stickerChunks, selectedChunkIndex, selectedChunkKeySet]);
+
+  const toggleStickerSelection = (key: string) => {
+    setSelectedStickerKeysByChunk(prev => {
+      const current = prev[selectedChunkIndex] || [];
+      if (current.includes(key)) {
+        return { ...prev, [selectedChunkIndex]: current.filter(k => k !== key) };
+      }
+      return { ...prev, [selectedChunkIndex]: [...current, key] };
+    });
+  };
+
+  const selectAllInChunk = () => {
+    setSelectedStickerKeysByChunk(prev => ({
+      ...prev,
+      [selectedChunkIndex]: (stickerChunks[selectedChunkIndex] || []).map(s => s.key)
+    }));
+  };
+
+  const clearChunkSelection = () => {
+    setSelectedStickerKeysByChunk(prev => ({
+      ...prev,
+      [selectedChunkIndex]: []
+    }));
+  };
+
+  const restoreChunkDefaults = selectAllInChunk;
+
   const fetchPackData = async () => {
     try {
       if (!BOT_TOKEN) {
@@ -192,7 +239,16 @@ export default function PreviewScreen() {
         throw new Error('Not enough supported stickers. WhatsApp needs at least 3 stickers per pack.');
       }
 
-      setStickerChunks(toChunks(supported, WHATSAPP_PACK_SIZE));
+      
+      const chunks = toChunks(supported, WHATSAPP_PACK_SIZE);
+      const initialSelection: Record<number, string[]> = {};
+      chunks.forEach((chunk, idx) => {
+        initialSelection[idx] = chunk.map(s => s.key);
+      });
+      setSelectedStickerKeysByChunk(initialSelection);
+      setStickerChunks(chunks);
+      setCustomPackName(data.title);
+
       setSelectedChunkIndex(0);
       setAddedChunkIndexes([]);
       setPreviewMap({});
@@ -209,7 +265,7 @@ export default function PreviewScreen() {
   };
 
   const handleAddToWhatsApp = async () => {
-    if (!selectedChunk.length || !packData || isProcessing) {
+    if (!selectedChunkStickers.length || !packData || isProcessing) {
       return;
     }
 
@@ -248,10 +304,10 @@ export default function PreviewScreen() {
       const preparedStickers: StickerMetadata[] = [];
       let trayIconPath = '';
 
-      for (let i = 0; i < selectedChunk.length; i++) {
-        setProcessingProgress(Math.round(((i + 1) / selectedChunk.length) * 100));
+      for (let i = 0; i < selectedChunkStickers.length; i++) {
+        setProcessingProgress(Math.round(((i + 1) / selectedChunkStickers.length) * 100));
         
-        const sticker = selectedChunk[i];
+        const sticker = selectedChunkStickers[i];
         const downloadUrl = await api.getStickerDownloadUrlByFileId(sticker.sourceFileId);
         
         const rawUri = await converter.downloadFile(
@@ -297,9 +353,9 @@ export default function PreviewScreen() {
       const identifier = `${baseIdentifier}_${packSessionToken}${chunkSuffix}`.slice(0, 96);
       const packTitle =
         stickerChunks.length > 1
-          ? `${packData.title} (${selectedChunkIndex + 1}/${stickerChunks.length})`
-          : packData.title;
-      const imageDataVersion = buildImageDataVersion(selectedChunk);
+          ? `${customPackName || packData.title} (${selectedChunkIndex + 1}/${stickerChunks.length})`
+          : customPackName || packData.title;
+      const imageDataVersion = buildImageDataVersion(selectedChunkStickers);
 
       const contentsJsonPath = await converter.generateContentsJson(
         identifier,
@@ -333,7 +389,12 @@ export default function PreviewScreen() {
       }
 
       if (nextAdded.length === stickerChunks.length) {
-        navigation.navigate('Success');
+                navigation.navigate('Success', {
+          sentPackCount: stickerChunks.length,
+          exportedStickerCount: selectedChunkStickers.length * stickerChunks.length, // approximation
+          packDisplayName: customPackName || packData.title,
+          coverUrl: previewMap[selectedChunkStickers[0]?.key] || ''
+        });
       } else {
         Alert.alert(
           'Pack sent to WhatsApp',
@@ -349,28 +410,6 @@ export default function PreviewScreen() {
     }
   };
 
-  const renderStickerItem = ({ item }: { item: PreparedSticker }) => {
-    const previewUrl = previewMap[item.key];
-
-    return (
-      <View style={styles.stickerBox}>
-        {previewUrl ? (
-          <Image source={previewUrl} style={styles.stickerImage} contentFit="contain" transition={160} />
-        ) : (
-          <View style={styles.stickerPlaceholder}>
-            <Text style={styles.stickerPlaceholderText}>{item.emoji}</Text>
-          </View>
-        )}
-
-        {item.sourceKind !== 'static' ? (
-          <View style={styles.sourceTag}>
-            <Text style={styles.sourceTagText}>{item.sourceKind === 'animated' ? 'A' : 'V'}</Text>
-          </View>
-        ) : null}
-      </View>
-    );
-  };
-
   if (isLoading) {
     return (
       <SafeAreaView style={styles.centerContainer}>
@@ -381,229 +420,228 @@ export default function PreviewScreen() {
   }
 
   return (
-    <SafeAreaView style={styles.container}>
-      <View style={styles.glowTop} />
-      <View style={styles.glowBottom} />
+    <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
+      {/* Top Header */}
       <View style={styles.header}>
-        <Text style={styles.title}>{packData?.title}</Text>
-        <Text style={styles.subtitle}>
-          {totalSupported} usable stickers • {stickerChunks.length} WhatsApp packs
-        </Text>
-        {animatedFallbackCount > 0 ? (
-          <Text style={styles.noteText}>
-            {animatedFallbackCount} animated/video Telegram stickers are exported as static thumbnails for WhatsApp.
-          </Text>
-        ) : null}
+        <TouchableOpacity style={styles.backButton} onPress={() => navigation.goBack()}>
+          <View style={styles.backIcon}>
+             <Feather name="arrow-left" size={24} color="#34D399" style={{ alignSelf: 'center' }} />
+          </View>
+        </TouchableOpacity>
+        <Text style={styles.headerTitle}>StickerBridge</Text>
+        <View style={{ width: 40, height: 40 }} />
       </View>
 
-      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chunkScrollContent}>
-        {stickerChunks.map((chunk, index) => {
-          const isSelected = index === selectedChunkIndex;
-          const isAdded = addedChunkIndexes.includes(index);
-          return (
-            <TouchableOpacity
-              key={`chunk-${index}`}
-              style={[styles.chunkCard, isSelected && styles.chunkCardSelected]}
-              onPress={() => setSelectedChunkIndex(index)}
-              disabled={isProcessing}
-            >
-              <Text style={[styles.chunkTitle, isSelected && styles.chunkTitleSelected]}>
-                Pack {index + 1}
-              </Text>
-              <Text style={[styles.chunkMeta, isSelected && styles.chunkMetaSelected]}>
-                {chunk.length} stickers
-              </Text>
-              <Text style={[styles.chunkState, isAdded && styles.chunkStateAdded]}>
-                {isAdded ? 'Added' : 'Pending'}
-              </Text>
-            </TouchableOpacity>
-          );
-        })}
+      {/* Progress Bar */}
+      <View style={styles.progressContainer}>
+        <View style={[styles.progressBarFilled, { width: `${Math.max(10, ((selectedChunkIndex + 1) / stickerChunks.length) * 100)}%` }]} />
+      </View>
+
+      <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
+        {/* Title & Badge */}
+        <View style={styles.titleRow}>
+           <View style={styles.titleLeft}>
+             <Text style={styles.mainTitle}>{packData?.title}</Text>
+             <Text style={styles.packHandle}>@{packData?.name}</Text>
+           </View>
+           <View style={styles.activeBadge}>
+             <Text style={styles.activeBadgeText}>ACTIVE PACK</Text>
+           </View>
+        </View>
+
+        {/* Input */}
+        <Text style={styles.inputLabel}>PACK NAME IN WHATSAPP</Text>
+        <View style={styles.inputContainer}>
+          <TextInput
+            style={styles.input}
+            value={customPackName}
+            onChangeText={setCustomPackName}
+            placeholder="Custom Pack Name"
+            placeholderTextColor="#718096"
+          />
+          <Text style={{color: '#718096', fontSize: 16}}>✎</Text>
+        </View>
+
+        {/* Chunks (Pack Tabs) */}
+        {stickerChunks.length > 1 && (
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chunksScroll}>
+            <View style={styles.chunksContainer}>
+              {stickerChunks.map((_, index) => {
+                 const isActive = index === selectedChunkIndex;
+                 const isAdded = addedChunkIndexes.includes(index);
+                 const chunkKeys = selectedStickerKeysByChunk[index] || [];
+                 
+                 return (
+                   <TouchableOpacity
+                     key={index}
+                     style={[styles.chunkTab, isActive && styles.chunkTabActive]}
+                     onPress={() => setSelectedChunkIndex(index)}
+                   >
+                     <Text style={[styles.chunkTabText, isActive && styles.chunkTabTextActive]}>
+                       Pack {index + 1} ({chunkKeys.length})
+                     </Text>
+                     <View style={[styles.chunkBadge, isAdded ? styles.chunkBadgeAdded : styles.chunkBadgePending]}>
+                       <Text style={[styles.chunkBadgeText, isAdded ? styles.chunkBadgeTextAdded : styles.chunkBadgeTextPending]}>
+                         {isAdded ? 'Added' : 'Pending'}
+                       </Text>
+                     </View>
+                   </TouchableOpacity>
+                 );
+              })}
+            </View>
+          </ScrollView>
+        )}
+
+        {/* Selection Actions Row */}
+        <View style={styles.actionRow}>
+           <View style={{flexDirection: 'row', gap: 16}}>
+             <TouchableOpacity onPress={selectAllInChunk}><Text style={styles.actionTextMint}>SELECT ALL</Text></TouchableOpacity>
+             <TouchableOpacity onPress={clearChunkSelection}><Text style={styles.actionTextGrey}>CLEAR</Text></TouchableOpacity>
+           </View>
+           <TouchableOpacity onPress={restoreChunkDefaults}>
+             <Text style={styles.actionTextGrey}>RESTORE DEFAULTS</Text>
+           </TouchableOpacity>
+        </View>
+
+        {/* Sticker Grid */}
+        <View style={styles.grid}>
+          {selectedChunk.map((sticker) => {
+            const isSelected = selectedChunkKeySet.has(sticker.key);
+            const previewUrl = previewMap[sticker.key];
+            const isAnimated = sticker.sourceKind !== 'static';
+
+            return (
+               <TouchableOpacity 
+                 key={sticker.key} 
+                 style={[styles.gridItem, isSelected && styles.gridItemActive]}
+                 onPress={() => toggleStickerSelection(sticker.key)}
+                 activeOpacity={0.8}
+               >
+                 {/* Top Left Indicator */}
+                 {isAnimated && (
+                   <View style={styles.animatedIndicator}>
+                     <Text style={styles.animatedIndicatorText}>{sticker.sourceKind === 'video' ? 'V' : 'A'}</Text>
+                   </View>
+                 )}
+                 
+                 {/* Top Right Checkbox */}
+                 <View style={[styles.checkbox, isSelected && styles.checkboxActive]}>
+                   {isSelected && <Text style={{color: '#000', fontSize: 10, fontWeight: 'bold'}}>✓</Text>}
+                 </View>
+                 
+                 {/* Image */}
+                 <View style={styles.imageContainer}>
+                   {previewUrl ? (
+                     <Image source={{ uri: previewUrl }} style={styles.stickerImage} contentFit="contain" />
+                   ) : (
+                     <ActivityIndicator color="#34D399" />
+                   )}
+                 </View>
+
+                 {/* Bottom Right Emoji */}
+                 <View style={styles.emojiBadge}>
+                    <Text style={styles.emojiText}>{sticker.emoji}</Text>
+                 </View>
+               </TouchableOpacity>
+            );
+          })}
+        </View>
+
+        {/* Bottom Status */}
+        <View style={styles.bottomStatus}>
+          <Text style={styles.selectedCountText}>Selected: {selectedChunkStickers.length}/{selectedChunk.length}</Text>
+          {selectedChunkStickers.length < 3 && (
+            <View style={styles.warningRow}>
+              <Text style={styles.warningIcon}>⚠</Text>
+              <Text style={styles.warningText}>Minimum 3 stickers required</Text>
+            </View>
+          )}
+        </View>
+
       </ScrollView>
 
-      {previewLoading ? (
-        <View style={styles.previewLoadingRow}>
-          <ActivityIndicator size="small" color="#7DD3FC" />
-          <Text style={styles.previewLoadingText}>Loading sticker previews...</Text>
-        </View>
-      ) : null}
-
-      <FlatList
-        data={selectedChunk}
-        keyExtractor={item => item.key}
-        numColumns={3}
-        contentContainerStyle={styles.gridContainer}
-        renderItem={renderStickerItem}
-      />
-
-      <View style={styles.footer}>
-        <TouchableOpacity 
-          style={[styles.button, isProcessing && styles.buttonDisabled]} 
-          onPress={handleAddToWhatsApp}
-          disabled={isProcessing || selectedChunk.length === 0}
-        >
-          {isProcessing ? (
-            <Text style={styles.buttonText}>Processing: {processingProgress}%</Text>
-          ) : (
-            <Text style={styles.buttonText}>
-              Add Pack {selectedChunkIndex + 1} of {stickerChunks.length} to WhatsApp
-            </Text>
-          )}
-        </TouchableOpacity>
+      {/* Bottom Button */}
+      <View style={styles.bottomActionContainer}>
+         <TouchableOpacity 
+           style={[
+             styles.primaryBtn, 
+             (isProcessing || selectedChunkStickers.length < 3) && styles.primaryBtnDisabled
+           ]} 
+           onPress={handleAddToWhatsApp}
+           disabled={isProcessing || selectedChunkStickers.length < 3}
+         >
+           {isProcessing ? (
+             <Text style={styles.primaryBtnText}>Processing {processingProgress}%...</Text>
+           ) : (
+             <>
+               <View style={styles.plusCircle}>
+                 <Feather name="plus" size={16} color="#34D399" />
+               </View>
+               <Text style={styles.primaryBtnText}>Add to WhatsApp ({selectedChunkStickers.length} selected)</Text>
+             </>
+           )}
+         </TouchableOpacity>
       </View>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#08131F' },
-  centerContainer: {
-    flex: 1,
-    backgroundColor: '#08131F',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  glowTop: {
-    position: 'absolute',
-    top: -100,
-    left: -20,
-    width: 250,
-    height: 250,
-    borderRadius: 125,
-    backgroundColor: 'rgba(14, 165, 233, 0.18)',
-  },
-  glowBottom: {
-    position: 'absolute',
-    bottom: -120,
-    right: -50,
-    width: 300,
-    height: 300,
-    borderRadius: 150,
-    backgroundColor: 'rgba(251, 146, 60, 0.16)',
-  },
-  loadingText: { color: '#D8E4F2', marginTop: 16, fontSize: 16 },
-  header: { padding: 20, paddingBottom: 10 },
-  title: {
-    fontSize: 29,
-    fontWeight: '800',
-    color: '#F8FAFC',
-    letterSpacing: -0.4,
-  },
-  subtitle: { fontSize: 15, color: '#AFC2D8', marginTop: 6 },
-  noteText: {
-    fontSize: 13,
-    color: '#7DD3FC',
-    marginTop: 8,
-    lineHeight: 19,
-  },
-  chunkScrollContent: {
-    paddingHorizontal: 16,
-    paddingBottom: 10,
-    gap: 10,
-  },
-  chunkCard: {
-    width: 116,
-    borderRadius: 14,
-    padding: 12,
-    backgroundColor: '#112036',
-    borderWidth: 1,
-    borderColor: '#20354E',
-  },
-  chunkCardSelected: {
-    backgroundColor: '#0E7490',
-    borderColor: '#67E8F9',
-  },
-  chunkTitle: {
-    color: '#E2E8F0',
-    fontWeight: '700',
-    fontSize: 14,
-  },
-  chunkTitleSelected: {
-    color: '#ECFEFF',
-  },
-  chunkMeta: {
-    marginTop: 5,
-    color: '#90A9C5',
-    fontSize: 12,
-  },
-  chunkMetaSelected: {
-    color: '#CFFAFE',
-  },
-  chunkState: {
-    marginTop: 8,
-    color: '#FB923C',
-    fontWeight: '700',
-    fontSize: 12,
-  },
-  chunkStateAdded: {
-    color: '#4ADE80',
-  },
-  previewLoadingRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 18,
-    paddingBottom: 6,
-  },
-  previewLoadingText: {
-    marginLeft: 8,
-    color: '#9FB6CF',
-    fontSize: 13,
-  },
-  gridContainer: { paddingHorizontal: 12, paddingBottom: 12 },
-  stickerBox: {
-    flex: 1,
-    margin: 7,
-    aspectRatio: 1,
-    backgroundColor: '#122136',
-    borderRadius: 12,
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#1E3553',
-  },
-  stickerImage: {
-    width: '86%',
-    height: '86%',
-  },
-  stickerPlaceholder: {
-    width: '82%',
-    height: '82%',
-    borderRadius: 12,
-    backgroundColor: '#1A314B',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  stickerPlaceholderText: {
-    fontSize: 28,
-  },
-  sourceTag: {
-    position: 'absolute',
-    top: 8,
-    right: 8,
-    width: 20,
-    height: 20,
-    borderRadius: 10,
-    backgroundColor: '#FB923C',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  sourceTagText: {
-    fontSize: 10,
-    color: '#08131F',
-    fontWeight: '900',
-  },
-  footer: {
-    padding: 20,
-    backgroundColor: '#08131F',
-    borderTopWidth: 1,
-    borderColor: '#1A2E45',
-  },
-  button: {
-    backgroundColor: '#25D366',
-    paddingVertical: 16,
-    borderRadius: 13,
-    alignItems: 'center',
-  },
-  buttonDisabled: { backgroundColor: '#128C7E', opacity: 0.7 },
-  buttonText: { color: '#F8FAFC', fontSize: 16, fontWeight: '800' },
+  container: { flex: 1, backgroundColor: '#0B0D14' },
+  loadingContainer: { flex: 1, backgroundColor: '#0B0D14', justifyContent: 'center', alignItems: 'center' },
+  centerContainer: { flex: 1, backgroundColor: '#0B0D14', justifyContent: 'center', alignItems: 'center' },
+  loadingText: { color: '#718096', marginTop: 16, fontSize: 16 },
+  header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingVertical: 16, backgroundColor: '#0B0D14' },
+  backButton: { width: 40, height: 40, justifyContent: 'center' },
+  backIcon: { /* placeholder for native text matching arrow */ },
+  headerTitle: { color: '#34D399', fontSize: 20, fontWeight: 'bold', letterSpacing: -0.5 },
+  settingsBtn: { width: 40, height: 40, alignItems: 'flex-end', justifyContent: 'center' },
+  progressContainer: { height: 4, backgroundColor: '#1A1D2D', marginHorizontal: 20, borderRadius: 2, marginBottom: 10, overflow: 'hidden' },
+  progressBarFilled: { height: '100%', backgroundColor: '#34D399', borderRadius: 2 },
+  scrollContent: { paddingHorizontal: 20, paddingBottom: 40 },
+  titleRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginTop: 10, marginBottom: 24 },
+  titleLeft: { flex: 1 },
+  mainTitle: { color: '#FFF', fontSize: 28, fontWeight: 'bold', marginBottom: 4 },
+  packHandle: { color: '#34D399', fontSize: 15 },
+  activeBadge: { backgroundColor: 'rgba(52, 211, 153, 0.1)', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 12, borderWidth: 1, borderColor: '#1A3329' },
+  activeBadgeText: { color: '#34D399', fontSize: 11, fontWeight: 'bold', letterSpacing: 1 },
+  inputLabel: { color: '#718096', fontSize: 11, fontWeight: 'bold', letterSpacing: 1, marginBottom: 8, textTransform: 'uppercase' },
+  inputContainer: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#13151D', borderRadius: 16, paddingHorizontal: 16, height: 56, marginBottom: 24, borderWidth: 1, borderColor: '#1A1D2D' },
+  input: { flex: 1, color: '#FFF', fontSize: 16, fontWeight: '500' },
+  chunksScroll: { marginBottom: 24 },
+  chunksContainer: { flexDirection: 'row', backgroundColor: '#050505', borderRadius: 16, padding: 4, borderWidth: 1, borderColor: '#1A1D2D' },
+  chunkTab: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 10, borderRadius: 12 },
+  chunkTabActive: { backgroundColor: '#13151D' },
+  chunkTabText: { color: '#718096', fontSize: 14, fontWeight: 'bold', marginRight: 8 },
+  chunkTabTextActive: { color: '#FFF' },
+  chunkBadge: { paddingHorizontal: 8, paddingVertical: 2, borderRadius: 8 },
+  chunkBadgeAdded: { backgroundColor: 'rgba(52, 211, 153, 0.15)' },
+  chunkBadgePending: { backgroundColor: '#1A1D2D' },
+  chunkBadgeText: { fontSize: 10, fontWeight: 'bold' },
+  chunkBadgeTextAdded: { color: '#34D399' },
+  chunkBadgeTextPending: { color: '#718096' },
+  actionRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 },
+  actionTextMint: { color: '#34D399', fontSize: 12, fontWeight: 'bold', letterSpacing: 0.5 },
+  actionTextGrey: { color: '#718096', fontSize: 12, fontWeight: 'bold', letterSpacing: 0.5 },
+  grid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between' },
+  gridItem: { width: '31%', aspectRatio: 1, backgroundColor: '#13151D', borderRadius: 16, marginBottom: 12, padding: 10, borderWidth: 1, borderColor: '#13151D' },
+  gridItemActive: { borderColor: '#34D399', backgroundColor: 'rgba(52,211,153,0.05)' },
+  animatedIndicator: { position: 'absolute', top: 8, left: 8, zIndex: 2 },
+  animatedIndicatorText: { color: '#FFF', fontSize: 10, fontWeight: 'bold' },
+  checkbox: { position: 'absolute', top: 8, right: 8, width: 16, height: 16, borderRadius: 8, borderWidth: 1, borderColor: '#4A5568', backgroundColor: '#1A1D2D', zIndex: 2, alignItems: 'center', justifyContent: 'center' },
+  checkboxActive: { borderColor: '#34D399', backgroundColor: '#34D399' },
+  imageContainer: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  stickerImage: { width: '80%', height: '80%' },
+  emojiBadge: { position: 'absolute', bottom: 4, right: 4,  width: 20, height: 20, borderRadius: 10, backgroundColor: '#1A1D2D', alignItems: 'center', justifyContent: 'center', zIndex: 2 },
+  emojiText: { fontSize: 10 },
+  bottomStatus: { alignItems: 'center', marginTop: 16, marginBottom: 16 },
+  selectedCountText: { color: '#FFF', fontSize: 16, fontWeight: 'bold', marginBottom: 6 },
+  warningRow: { flexDirection: 'row', alignItems: 'center' },
+  warningIcon: { color: '#FC8181', fontSize: 12, marginRight: 6 },
+  warningText: { color: '#FC8181', fontSize: 13, fontWeight: 'bold' },
+  bottomActionContainer: { paddingHorizontal: 20, paddingBottom: 20, paddingTop: 10, backgroundColor: '#0B0D14' },
+  primaryBtn: { backgroundColor: '#34D399', borderRadius: 16, height: 56, flexDirection: 'row', alignItems: 'center', justifyContent: 'center' },
+  primaryBtnDisabled: { opacity: 0.5 },
+  plusCircle: { width: 24, height: 24, borderRadius: 12, backgroundColor: '#000', alignItems: 'center', justifyContent: 'center', marginRight: 10 },
+  primaryBtnText: { color: '#000', fontSize: 16, fontWeight: 'bold' }
 });

@@ -8,8 +8,12 @@ import { StatusBar } from 'expo-status-bar';
 
 type RootStackParamList = {
   Home: undefined;
-  Preview: { packName: string };
-  Success: undefined;
+  Preview: { packName: string; initialCustomPackName?: string };
+  Success: {
+    sentPackCount: number;
+    exportedStickerCount: number;
+    packDisplayName: string;
+  };
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
@@ -35,7 +39,7 @@ export default function App() {
         <Stack.Screen 
           name="Preview" 
           component={PreviewScreen} 
-          options={{ title: 'Pack Preview' }} 
+          options={{ headerShown: false }} 
         />
         <Stack.Screen 
           name="Success" 
