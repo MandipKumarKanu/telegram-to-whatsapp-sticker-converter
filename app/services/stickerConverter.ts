@@ -35,6 +35,19 @@ export class StickerConverter {
     return dir;
   }
 
+  // Optional: Clean up the raw directory after conversion sequence is complete
+  async clearRawCache() {
+    try {
+      const dir = `${FileSystem.cacheDirectory}raw_stickers/`;
+      const dirInfo = await FileSystem.getInfoAsync(dir);
+      if (dirInfo.exists) {
+        await FileSystem.deleteAsync(dir, { idempotent: true });
+      }
+    } catch (e) {
+      console.warn("Failed to clear raw sticker cache:", e);
+    }
+  }
+
   // Converts a downloaded image to exactly 512x512 WebP (< 100KB is usually achieved with normal compression, but we can lower quality if needed)
   async convertToWhatsAppSticker(sourceUri: string, index: number): Promise<StickerConversionResult> {
     const attempts = [

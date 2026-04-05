@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { Feather } from "@expo/vector-icons";
+import { useKeepAwake } from 'expo-keep-awake';
 import {
   View,
   Text,
@@ -78,15 +79,16 @@ const normalizeIdentifier = (input: string): string => {
 };
 
 const buildImageDataVersion = (chunk: PreparedSticker[]): string => {
-  const source = `${Date.now()}_${chunk.map((sticker) => sticker.key).join("_")}`;
+  const source = `${chunk.map((sticker) => sticker.key).join("_")}`;
   let hash = 0;
   for (let i = 0; i < source.length; i++) {
     hash = (hash * 31 + source.charCodeAt(i)) >>> 0;
   }
-  return `${Date.now()}_${hash.toString(16)}`;
+  return `v_${Math.abs(hash).toString(16)}`;
 };
 
 export default function PreviewScreen() {
+  useKeepAwake(); // Prevent screen sleep during downloading
   const route = useRoute<PreviewRouteProp>();
   const navigation =
     useNavigation<NativeStackNavigationProp<RootStackParamList>>();
@@ -139,17 +141,21 @@ export default function PreviewScreen() {
       setPreviewLoading(true);
       try {
         const api = new TelegramApi(BOT_TOKEN);
-        const pairs = await Promise.all(
-          missing.map(async (sticker) => {
-            const url = await api.getStickerDownloadUrlByFileId(
-              sticker.sourceFileId,
-            );
-            return [sticker.key, url] as const;
-          }),
-        );
-
-        if (cancelled) {
-          return;
+        
+        // Fetch in smaller batches (e.g. 5 at a time) to prevent Telegram API HTTP 429 Too Many Requests
+        const batchSize = 5;
+        const pairs: [string, string][] = [];
+        
+        for (let i = 0; i < missing.length; i += batchSize) {
+          if (cancelled) return;
+          const batch = missing.slice(i, i + batchSize);
+          const batchResults = await Promise.all(
+            batch.map(async (sticker) => {
+              const url = await api.getStickerDownloadUrlByFileId(sticker.sourceFileId);
+              return [sticker.key, url] as [string, string];
+            })
+          );
+          pairs.push(...batchResults);
         }
 
         setPreviewMap((prev) => {
@@ -301,7 +307,7 @@ export default function PreviewScreen() {
 
       const baseIdentifier = normalizeIdentifier(packData.name);
       const chunkSuffix = stickerChunks.length > 1 ? `_part${selectedChunkIndex + 1}` : "";
-      const identifier = `${baseIdentifier}_${packSessionToken}${chunkSuffix}`.slice(0, 96);
+      const identifier = `${baseIdentifier}${chunkSuffix}`.slice(0, 96);
       const packTitle = stickerChunks.length > 1
           ? `${customPackName || packData.title} (${selectedChunkIndex + 1}/${stickerChunks.length})`
           : customPackName || packData.title;
@@ -334,17 +340,23 @@ export default function PreviewScreen() {
           coverUrl: previewMap[selectedChunkStickers[0]?.key] || "",
         });
       } else {
-        Alert.alert(
-          "Pack sent to WhatsApp",
-          `Pack ${selectedChunkIndex + 1}/${stickerChunks.length} was sent. In WhatsApp, tap "Add" when prompted, then return here for the next pack.`,
-        );
+        setTimeout(() => {
+          Alert.alert(
+            "Pack sent to WhatsApp",
+            `Pack ${selectedChunkIndex + 1}/${stickerChunks.length} was sent. In WhatsApp, tap "Add" when prompted, then return here for the next pack.`,
+          );
+        }, 300);
       }
+      setIsProcessing(false);
     } catch (e: any) {
       console.error(e);
-      setHasError(true);
-      setErrorMessage(e.message || "Failed to prepare sticker pack.");
-    } finally {
-      setIsProcessing(false);
+      // Wait a short delay to ensure Android Activity transition finishes before rendering the modal,
+      // preventing the "frozen UI" bug requiring a user tap.
+      setTimeout(() => {
+        setHasError(true);
+        setErrorMessage(e.message || "Failed to prepare sticker pack.");
+        setIsProcessing(false);
+      }, 300);
     }
   };
 
@@ -452,7 +464,7 @@ export default function PreviewScreen() {
       const chunkSuffix =
         stickerChunks.length > 1 ? `_part${selectedChunkIndex + 1}` : "";
       const identifier =
-        `${baseIdentifier}_${packSessionToken}${chunkSuffix}`.slice(0, 96);
+        `${baseIdentifier}${chunkSuffix}`.slice(0, 96);
       const packTitle =
         stickerChunks.length > 1
           ? `${customPackName || packData.title} (${selectedChunkIndex + 1}/${stickerChunks.length})`
@@ -473,6 +485,9 @@ export default function PreviewScreen() {
       });
       const stagedFiles = await FileSystem.readDirectoryAsync(destDir);
       console.log("Staged sticker asset files:", stagedFiles);
+
+      // Clean up the temporary raw Telegram downloads to save device storage
+      await converter.clearRawCache();
 
       console.log(
         "Finished processing assets locally. Handing off to native module for WhatsApp.",
@@ -512,17 +527,23 @@ export default function PreviewScreen() {
           coverUrl: previewMap[selectedChunkStickers[0]?.key] || "",
         });
       } else {
-        Alert.alert(
-          "Pack sent to WhatsApp",
-          `Pack ${selectedChunkIndex + 1}/${stickerChunks.length} was sent. In WhatsApp, tap "Add" when prompted, then return here for the next pack.`,
-        );
+        setTimeout(() => {
+          Alert.alert(
+            "Pack sent to WhatsApp",
+            `Pack ${selectedChunkIndex + 1}/${stickerChunks.length} was sent. In WhatsApp, tap "Add" when prompted, then return here for the next pack.`,
+          );
+        }, 300);
       }
+      setIsProcessing(false);
     } catch (e: any) {
       console.error(e);
-      setHasError(true);
-      setErrorMessage(e.message || "Failed to prepare sticker pack.");
-    } finally {
-      setIsProcessing(false);
+      // Wait a short delay to ensure Android Activity transition finishes before rendering the modal,
+      // preventing the "frozen UI" bug requiring a user tap.
+      setTimeout(() => {
+        setHasError(true);
+        setErrorMessage(e.message || "Failed to prepare sticker pack.");
+        setIsProcessing(false);
+      }, 300);
     }
   };
 
@@ -806,14 +827,14 @@ export default function PreviewScreen() {
               Processing {processingProgress}%...
             </Text>
           ) : (
-            <>
+            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center' }}>
               <View style={styles.plusCircle}>
                 <Feather name="plus" size={16} color="#34D399" />
               </View>
               <Text style={styles.primaryBtnText}>
                 Add to WhatsApp ({selectedChunkStickers.length} selected)
               </Text>
-            </>
+            </View>
           )}
         </TouchableOpacity>
       </View>

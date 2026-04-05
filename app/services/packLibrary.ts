@@ -85,6 +85,23 @@ export async function upsertStoredPack(
   return normalizeRecords(records);
 }
 
+export async function touchStoredPack(packName: string): Promise<StoredPackRecord[]> {
+  const records = await readRawLibrary();
+  const index = records.findIndex(record => record.packName === packName);
+
+  if (index < 0) {
+    return normalizeRecords(records);
+  }
+
+  records[index] = {
+    ...records[index],
+    updatedAt: new Date().toISOString(),
+  };
+
+  await writeRawLibrary(records);
+  return normalizeRecords(records);
+}
+
 export async function getStoredPack(packName: string): Promise<StoredPackRecord | null> {
   const records = await readRawLibrary();
   const found = records.find(record => record.packName === packName);
