@@ -113,6 +113,10 @@ export default function PreviewScreen() {
   const [selectedStickerKeysByChunk, setSelectedStickerKeysByChunk] = useState<
     Record<number, string[]>
   >({});
+  
+  const [previewModalVisible, setPreviewModalVisible] = useState(false);
+  const [previewStickerUrl, setPreviewStickerUrl] = useState<string | null>(null);
+  const [previewStickerEmoji, setPreviewStickerEmoji] = useState<string | null>(null);
 
   useEffect(() => {
     fetchPackData();
@@ -712,7 +716,15 @@ export default function PreviewScreen() {
                 key={sticker.key}
                 style={[styles.gridItem, isSelected && styles.gridItemActive]}
                 onPress={() => toggleStickerSelection(sticker.key)}
-                activeOpacity={0.8}
+                onLongPress={() => {
+                  if (previewUrl) {
+                    setPreviewStickerUrl(previewUrl);
+                    setPreviewStickerEmoji(sticker.emoji);
+                    setPreviewModalVisible(true);
+                  }
+                }}
+                activeOpacity={0.7}
+                delayLongPress={300}
               >
                 {/* Top Left Indicator */}
                 {isAnimated && (
@@ -844,6 +856,35 @@ export default function PreviewScreen() {
             </TouchableOpacity>
           </View>
         </View>
+      </Modal>
+
+      {/* Sticker Preview Modal */}
+      <Modal
+        visible={previewModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setPreviewModalVisible(false)}
+      >
+        <TouchableOpacity 
+          style={styles.previewModalOverlay} 
+          activeOpacity={1} 
+          onPress={() => setPreviewModalVisible(false)}
+        >
+          <View style={styles.previewModalContent}>
+            {previewStickerUrl && (
+              <Image
+                source={{ uri: previewStickerUrl }}
+                style={styles.previewModalImage}
+                contentFit="contain"
+              />
+            )}
+            {previewStickerEmoji && (
+              <View style={styles.previewModalEmojiBadge}>
+                <Text style={styles.previewModalEmojiText}>{previewStickerEmoji}</Text>
+              </View>
+            )}
+          </View>
+        </TouchableOpacity>
       </Modal>
     </SafeAreaView>
   );
@@ -1137,4 +1178,34 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   secondaryBtnText: { color: "#718096", fontSize: 16, fontWeight: "bold" },
+  previewModalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.85)",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  previewModalContent: {
+    width: "80%",
+    aspectRatio: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    backgroundColor: "transparent",
+  },
+  previewModalImage: {
+    width: "100%",
+    height: "100%",
+  },
+  previewModalEmojiBadge: {
+    position: "absolute",
+    bottom: -75,
+    backgroundColor: "#13151D",
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    borderRadius: 30,
+    borderWidth: 1,
+    borderColor: "#34D399",
+  },
+  previewModalEmojiText: {
+    fontSize: 32,
+  },
 });
