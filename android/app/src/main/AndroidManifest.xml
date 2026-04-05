@@ -9,8 +9,21 @@
   <queries>
     <package android:name="com.whatsapp" />
     <package android:name="com.whatsapp.w4b" />
+    <package android:name="com.gbwhatsapp" />
+    <package android:name="com.aero" />
+    <package android:name="com.yowhatsapp" />
+    <package android:name="com.fmwhatsapp" />
+    <package android:name="com.whatsapp.plus" />
+    <package android:name="com.obwhatsapp" />
+    
     <provider android:authorities="com.whatsapp.provider.sticker_whitelist_check" />
     <provider android:authorities="com.whatsapp.w4b.provider.sticker_whitelist_check" />
+    <provider android:authorities="com.gbwhatsapp.provider.sticker_whitelist_check" />
+    <provider android:authorities="com.aero.provider.sticker_whitelist_check" />
+    <provider android:authorities="com.yowhatsapp.provider.sticker_whitelist_check" />
+    <provider android:authorities="com.fmwhatsapp.provider.sticker_whitelist_check" />
+    <provider android:authorities="com.whatsapp.plus.provider.sticker_whitelist_check" />
+    <provider android:authorities="com.obwhatsapp.provider.sticker_whitelist_check" />
 
     <!-- Support checking for http(s) links via the Linking API -->
     <intent>

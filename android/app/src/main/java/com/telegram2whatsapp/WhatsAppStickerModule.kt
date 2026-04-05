@@ -219,6 +219,23 @@ class WhatsAppStickerModule(reactContext: ReactApplicationContext) :
                 return
             }
 
+            val baseIntent = Intent()
+            baseIntent.action = "com.whatsapp.intent.action.ENABLE_STICKER_PACK"
+
+            val resolveInfoList = activity.packageManager.queryIntentActivities(baseIntent, 0)
+            if (resolveInfoList.isEmpty()) {
+                promise.reject("E_WHATSAPP_NOT_INSTALLED", "No supported version of WhatsApp is installed on this device.")
+                pendingPromise = null
+                return
+            }
+
+            // Prefer official ones if they exist, else just take the first one found
+            val targetPackage = resolveInfoList.map { it.activityInfo.packageName }.let { foundApps ->
+                foundApps.firstOrNull { it == "com.whatsapp" }
+                    ?: foundApps.firstOrNull { it == "com.whatsapp.w4b" }
+                    ?: foundApps.first()
+            }
+
             val intent = Intent()
             intent.action = "com.whatsapp.intent.action.ENABLE_STICKER_PACK"
             intent.putExtra("sticker_pack_id", identifier)
@@ -226,34 +243,22 @@ class WhatsAppStickerModule(reactContext: ReactApplicationContext) :
             intent.putExtra("sticker_pack_name", packName)
             intent.putExtra("sticker_pack_publisher", "StickerBridge By Mandy")
             intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            Log.d("WhatsAppStickerModule", "Launching add flow for pack id=$identifier name=$packName")
+            intent.setPackage(targetPackage)
+            
+            Log.d("WhatsAppStickerModule", "Launching add flow for pack id=$identifier name=$packName targeting=$targetPackage")
 
-            // Try WhatsApp
-            intent.setPackage("com.whatsapp")
+            validateProviderReadable(identifier)
+
             try {
-                validateProviderReadable(identifier)
-                val isAlreadyWhitelisted = isWhitelisted("com.whatsapp.provider.sticker_whitelist_check", identifier)
-                Log.d("WhatsAppStickerModule", "Whitelist check (com.whatsapp): $isAlreadyWhitelisted")
-                Log.d("WhatsAppStickerModule", "Starting intent with package com.whatsapp")
+                Log.d("WhatsAppStickerModule", "Starting intent with package $targetPackage")
                 pendingPromise = promise
                 activity.startActivityForResult(intent, ADD_STICKER_PACK_REQUEST_CODE)
-                return
             } catch (e: ActivityNotFoundException) {
-                // Try WhatsApp Business if normal WhatsApp is not installed
-                intent.setPackage("com.whatsapp.w4b")
-                try {
-                    validateProviderReadable(identifier)
-                    val isAlreadyWhitelisted = isWhitelisted("com.whatsapp.w4b.provider.sticker_whitelist_check", identifier)
-                    Log.d("WhatsAppStickerModule", "Whitelist check (com.whatsapp.w4b): $isAlreadyWhitelisted")
-                    Log.d("WhatsAppStickerModule", "Starting intent with package com.whatsapp.w4b")
-                    pendingPromise = promise
-                    activity.startActivityForResult(intent, ADD_STICKER_PACK_REQUEST_CODE)
-                    return
-                } catch (ex: ActivityNotFoundException) {
-                    pendingPromise = null
-                    promise.reject("E_WHATSAPP_NOT_INSTALLED", "WhatsApp is not installed on this device.")
-                }
+                Log.d("WhatsAppStickerModule", "$targetPackage not found or doesn't handle the intent")
+                pendingPromise = null
+                promise.reject("E_WHATSAPP_NOT_INSTALLED", "Target WhatsApp package could not be launched.")
             }
+
         } catch (e: Exception) {
             pendingPromise = null
             promise.reject("E_UNKNOWN", "An error occurred while launching WhatsApp: " + e.message)
