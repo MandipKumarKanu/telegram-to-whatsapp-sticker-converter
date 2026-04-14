@@ -80,6 +80,11 @@ def enableMinifyInReleaseBuilds = (findProperty('android.enableMinifyInReleaseBu
  * this variant is about 6MiB larger per architecture than default.
  */
 def jscFlavor = 'io.github.react-native-community:jsc-android:2026004.+'
+def isReleaseBuildTask = gradle.startParameter.taskNames.any { it.toLowerCase().contains("release") }
+def releaseStoreFileProp = findProperty('MYAPP_UPLOAD_STORE_FILE')
+def releaseStorePasswordProp = findProperty('MYAPP_UPLOAD_STORE_PASSWORD')
+def releaseKeyAliasProp = findProperty('MYAPP_UPLOAD_KEY_ALIAS')
+def releaseKeyPasswordProp = findProperty('MYAPP_UPLOAD_KEY_PASSWORD')
 
 android {
     ndkVersion rootProject.ext.ndkVersion
@@ -104,6 +109,18 @@ android {
             keyAlias 'androiddebugkey'
             keyPassword 'android'
         }
+        release {
+            if (releaseStoreFileProp && releaseStorePasswordProp && releaseKeyAliasProp && releaseKeyPasswordProp) {
+                storeFile file(releaseStoreFileProp)
+                storePassword releaseStorePasswordProp
+                keyAlias releaseKeyAliasProp
+                keyPassword releaseKeyPasswordProp
+            } else if (isReleaseBuildTask) {
+                throw new GradleException(
+                    "Missing release signing properties. Set MYAPP_UPLOAD_STORE_FILE, MYAPP_UPLOAD_STORE_PASSWORD, MYAPP_UPLOAD_KEY_ALIAS, and MYAPP_UPLOAD_KEY_PASSWORD in gradle.properties or via -P flags."
+                )
+            }
+        }
     }
     buildTypes {
         debug {
@@ -112,7 +129,7 @@ android {
         release {
             // Caution! In production, you need to generate your own keystore file.
             // see https://reactnative.dev/docs/signed-apk-android.
-            signingConfig signingConfigs.debug
+            signingConfig signingConfigs.release
             def enableShrinkResources = findProperty('android.enableShrinkResourcesInReleaseBuilds') ?: 'false'
             shrinkResources enableShrinkResources.toBoolean()
             minifyEnabled enableMinifyInReleaseBuilds
@@ -155,6 +172,9 @@ android {
 dependencies {
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
+    implementation("com.aureusapps.android:webp-android:1.0.8")
+    implementation("com.airbnb.android:lottie:6.4.0")
+    implementation("io.github.jamaismagic.ffmpeg:ffmpeg-kit-main-16kb:6.1.4")
 
     def isGifEnabled = (findProperty('expo.gif.enabled') ?: "") == "true";
     def isWebpEnabled = (findProperty('expo.webp.enabled') ?: "") == "true";

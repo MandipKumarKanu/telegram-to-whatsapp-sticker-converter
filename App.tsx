@@ -4,12 +4,14 @@ import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import HomeScreen from './app/screens/HomeScreen';
 import PreviewScreen from './app/screens/PreviewScreen';
 import SuccessScreen from './app/screens/SuccessScreen';
+import DiagnosticsScreen from './app/screens/DiagnosticsScreen';
 import ErrorBoundary from './app/components/ErrorBoundary';
 import { StatusBar } from 'expo-status-bar';
 
 type RootStackParamList = {
   Home: undefined;
   Preview: { packName: string; initialCustomPackName?: string };
+  Diagnostics: undefined;
   Success: {
     sentPackCount: number;
     exportedStickerCount: number;
@@ -47,6 +49,11 @@ export default function App() {
             name="Success" 
             component={SuccessScreen} 
             options={{ headerShown: false }} 
+          />
+          <Stack.Screen
+            name="Diagnostics"
+            component={DiagnosticsScreen}
+            options={{ headerShown: false }}
           />
         </Stack.Navigator>
       </NavigationContainer>

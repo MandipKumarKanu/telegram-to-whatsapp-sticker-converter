@@ -7,19 +7,39 @@ import android.net.Uri
 import android.database.Cursor
 import android.content.ContentResolver
 import android.content.res.AssetFileDescriptor
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.media.MediaMetadataRetriever
+import com.airbnb.lottie.LottieComposition
+import com.airbnb.lottie.LottieCompositionFactory
+import com.airbnb.lottie.LottieDrawable
 import com.facebook.react.bridge.ActivityEventListener
+import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import android.util.Log
+import com.aureusapps.android.webpandroid.encoder.WebPAnimEncoder
+import com.aureusapps.android.webpandroid.encoder.WebPAnimEncoderOptions
+import com.aureusapps.android.webpandroid.encoder.WebPConfig
+import com.aureusapps.android.webpandroid.encoder.WebPEncoder
+import com.aureusapps.android.webpandroid.encoder.WebPMuxAnimParams
+import com.aureusapps.android.webpandroid.encoder.WebPPreset
+import com.arthenica.ffmpegkit.FFmpegKit
+import com.arthenica.ffmpegkit.ReturnCode
 import java.io.File
+import java.util.Locale
+import java.util.zip.GZIPInputStream
 
 class WhatsAppStickerModule(reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext), ActivityEventListener {
 
     companion object {
         private const val ADD_STICKER_PACK_REQUEST_CODE = 8142
+        private const val STICKER_SIZE = 512
+        private const val MAX_ANIM_DURATION_MS = 3000L
     }
 
     private var pendingPromise: Promise? = null
@@ -39,6 +59,434 @@ class WhatsAppStickerModule(reactContext: ReactApplicationContext) :
             return File(parsed.path!!)
         }
         return File(pathOrUri)
+    }
+
+    private data class TranscodeOptions(
+        val fps: Int,
+        val quality: Float,
+        val method: Int,
+    )
+
+    private fun transcodeOptionsForPreset(preset: String): TranscodeOptions {
+        return when (preset.lowercase(Locale.US)) {
+            "fast" -> TranscodeOptions(fps = 8, quality = 52f, method = 4)
+            "small" -> TranscodeOptions(fps = 10, quality = 46f, method = 6)
+            else -> TranscodeOptions(fps = 12, quality = 60f, method = 5)
+        }
+    }
+
+    private fun transcodeVideoWithFfmpeg(
+        inputFile: File,
+        outputFile: File,
+        mode: String,
+        options: TranscodeOptions,
+    ) {
+        val quality = options.quality.toInt().coerceIn(35, 85)
+        val compressionLevel = options.method.coerceIn(3, 6)
+        val fps = options.fps.coerceIn(8, 14)
+        val durationSeconds = String.format(Locale.US, "%.1f", MAX_ANIM_DURATION_MS / 1000.0)
+        val baseFilter =
+            "scale=${STICKER_SIZE}:${STICKER_SIZE}:force_original_aspect_ratio=decrease:flags=lanczos," +
+                "pad=${STICKER_SIZE}:${STICKER_SIZE}:(ow-iw)/2:(oh-ih)/2:color=0x00000000,format=rgba"
+
+        val command = when (mode.lowercase(Locale.US)) {
+            "animated-webp" ->
+                "-y -i \"${inputFile.absolutePath}\" -an -t $durationSeconds " +
+                    "-vf \"fps=$fps,$baseFilter\" " +
+                    "-c:v libwebp -preset picture -lossless 0 -q:v $quality " +
+                    "-compression_level $compressionLevel -loop 0 -vsync 0 " +
+                    "-pix_fmt yuva420p \"${outputFile.absolutePath}\""
+
+            "still-webp" ->
+                "-y -ss 0.5 -i \"${inputFile.absolutePath}\" -an -frames:v 1 " +
+                    "-vf \"$baseFilter\" " +
+                    "-c:v libwebp -compression_level $compressionLevel " +
+                    "-quality $quality -lossless 0 \"${outputFile.absolutePath}\""
+
+            else -> throw IllegalArgumentException("Unsupported transcode mode: $mode")
+        }
+
+        val session = FFmpegKit.execute(command)
+        val returnCode = session.returnCode
+        if (!ReturnCode.isSuccess(returnCode) || !outputFile.exists() || outputFile.length() <= 0L) {
+            throw IllegalStateException("FFmpeg video transcode failed (mode=$mode, returnCode=$returnCode)")
+        }
+    }
+
+    private fun fitBitmapToStickerCanvas(source: Bitmap): Bitmap {
+        val targetSize = STICKER_SIZE
+        val outputBitmap = Bitmap.createBitmap(targetSize, targetSize, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(outputBitmap)
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+
+        val sourceWidth = source.width.toFloat().coerceAtLeast(1f)
+        val sourceHeight = source.height.toFloat().coerceAtLeast(1f)
+        val scale = minOf(targetSize / sourceWidth, targetSize / sourceHeight)
+
+        val destWidth = sourceWidth * scale
+        val destHeight = sourceHeight * scale
+        val left = (targetSize - destWidth) / 2f
+        val top = (targetSize - destHeight) / 2f
+
+        val destRect = android.graphics.RectF(left, top, left + destWidth, top + destHeight)
+        canvas.drawBitmap(source, null, destRect, paint)
+
+        return outputBitmap
+    }
+
+    private fun decodeTgsJson(inputFile: File): String {
+        return try {
+            GZIPInputStream(inputFile.inputStream()).bufferedReader(Charsets.UTF_8).use { it.readText() }
+        } catch (_: Exception) {
+            // Some tools may already provide decompressed JSON; support both forms.
+            inputFile.readText()
+        }
+    }
+
+    private fun loadTgsComposition(inputFile: File): LottieComposition {
+        val tgsJson = decodeTgsJson(inputFile)
+        val parseResult = LottieCompositionFactory.fromJsonStringSync(tgsJson, inputFile.name)
+        return parseResult.value
+            ?: throw IllegalStateException(
+                parseResult.exception?.message
+                    ?: "Failed to parse Telegram TGS animation.",
+            )
+    }
+
+    private fun createTgsDrawable(composition: LottieComposition): LottieDrawable {
+        return LottieDrawable().apply {
+            setComposition(composition)
+            setBounds(0, 0, STICKER_SIZE, STICKER_SIZE)
+        }
+    }
+
+    private fun renderTgsFrame(drawable: LottieDrawable, progress: Float): Bitmap {
+        val frameBitmap = Bitmap.createBitmap(STICKER_SIZE, STICKER_SIZE, Bitmap.Config.ARGB_8888)
+        val frameCanvas = Canvas(frameBitmap)
+        drawable.progress = progress.coerceIn(0f, 1f)
+        drawable.draw(frameCanvas)
+        return frameBitmap
+    }
+
+    private fun encodeStillWebpFromVideo(inputFile: File, outputFile: File, options: TranscodeOptions) {
+        val retriever = MediaMetadataRetriever()
+        var frameBitmap: Bitmap? = null
+        var fittedBitmap: Bitmap? = null
+        var encoder: WebPEncoder? = null
+
+        try {
+            retriever.setDataSource(inputFile.absolutePath)
+            val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull() ?: 0L
+            val frameTimeMs = if (durationMs > 0) durationMs / 2 else 0
+
+            frameBitmap = retriever.getFrameAtTime(frameTimeMs * 1000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                ?: throw IllegalStateException("Failed to decode frame from video")
+
+            fittedBitmap = fitBitmapToStickerCanvas(frameBitmap)
+            encoder = WebPEncoder(reactApplicationContext, STICKER_SIZE, STICKER_SIZE)
+            encoder.configure(
+                config = WebPConfig(
+                    lossless = WebPConfig.COMPRESSION_LOSSY,
+                    quality = options.quality,
+                    method = options.method,
+                    alphaCompression = WebPConfig.ALPHA_COMPRESSION_WITH_LOSSLESS,
+                ),
+                preset = WebPPreset.WEBP_PRESET_PICTURE,
+            )
+            encoder.encode(fittedBitmap, Uri.fromFile(outputFile))
+        } finally {
+            encoder?.release()
+            fittedBitmap?.recycle()
+            frameBitmap?.recycle()
+            retriever.release()
+        }
+    }
+
+    private fun encodeStillWebpFromTgs(inputFile: File, outputFile: File, options: TranscodeOptions) {
+        var frameBitmap: Bitmap? = null
+        var encoder: WebPEncoder? = null
+
+        try {
+            val composition = loadTgsComposition(inputFile)
+            val drawable = createTgsDrawable(composition)
+
+            frameBitmap = renderTgsFrame(drawable, 0.5f)
+            encoder = WebPEncoder(reactApplicationContext, STICKER_SIZE, STICKER_SIZE)
+            encoder.configure(
+                config = WebPConfig(
+                    lossless = WebPConfig.COMPRESSION_LOSSY,
+                    quality = options.quality,
+                    method = options.method,
+                    alphaCompression = WebPConfig.ALPHA_COMPRESSION_WITH_LOSSLESS,
+                ),
+                preset = WebPPreset.WEBP_PRESET_DRAWING,
+            )
+            encoder.encode(frameBitmap, Uri.fromFile(outputFile))
+        } finally {
+            encoder?.release()
+            frameBitmap?.recycle()
+        }
+    }
+
+    private fun encodeAnimatedWebpFromVideo(inputFile: File, outputFile: File, options: TranscodeOptions) {
+        val retriever = MediaMetadataRetriever()
+        var encoder: WebPAnimEncoder? = null
+
+        try {
+            retriever.setDataSource(inputFile.absolutePath)
+
+            val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull()
+                ?.coerceAtLeast(500L)
+                ?: 2000L
+            val clippedDurationMs = durationMs.coerceAtMost(MAX_ANIM_DURATION_MS)
+            val frameDelayMs = (1000f / options.fps).toLong().coerceAtLeast(80L)
+            val requestedFrames = (clippedDurationMs / frameDelayMs).toInt().coerceIn(6, 48)
+
+            encoder = WebPAnimEncoder(
+                context = reactApplicationContext,
+                width = STICKER_SIZE,
+                height = STICKER_SIZE,
+                options = WebPAnimEncoderOptions(
+                    allowMixed = false,
+                    minimizeSize = false,
+                    animParams = WebPMuxAnimParams(loopCount = 0),
+                ),
+            )
+            encoder.configure(
+                config = WebPConfig(
+                    lossless = WebPConfig.COMPRESSION_LOSSY,
+                    quality = options.quality,
+                    method = options.method,
+                    alphaCompression = WebPConfig.ALPHA_COMPRESSION_WITH_LOSSLESS,
+                ),
+                preset = WebPPreset.WEBP_PRESET_PICTURE,
+            )
+
+            var addedFrames = 0
+            for (i in 0 until requestedFrames) {
+                val timeUs = (i * frameDelayMs * 1000L).coerceAtMost(clippedDurationMs * 1000L)
+                val frameBitmap = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                    ?: continue
+
+                val fittedBitmap = fitBitmapToStickerCanvas(frameBitmap)
+                frameBitmap.recycle()
+
+                encoder.addFrame(addedFrames * frameDelayMs, fittedBitmap)
+                fittedBitmap.recycle()
+                addedFrames += 1
+            }
+
+            if (addedFrames < 6) {
+                throw IllegalStateException("Could not extract enough frames for animated sticker.")
+            }
+
+            val animationDurationMs = addedFrames * frameDelayMs
+            encoder.assemble(animationDurationMs, Uri.fromFile(outputFile))
+        } finally {
+            encoder?.release()
+            retriever.release()
+        }
+    }
+
+    private fun encodeAnimatedWebpFromTgs(inputFile: File, outputFile: File, options: TranscodeOptions) {
+        var encoder: WebPAnimEncoder? = null
+
+        try {
+            val composition = loadTgsComposition(inputFile)
+            val drawable = createTgsDrawable(composition)
+
+            val compositionFrames = (composition.endFrame - composition.startFrame).coerceAtLeast(1f)
+            val compositionFrameRate = composition.frameRate.coerceAtLeast(1f)
+            val compositionDurationMs = ((compositionFrames / compositionFrameRate) * 1000f)
+                .toLong()
+                .coerceAtLeast(500L)
+            val clippedDurationMs = compositionDurationMs.coerceAtMost(MAX_ANIM_DURATION_MS)
+            val frameDelayMs = (1000f / options.fps).toLong().coerceAtLeast(80L)
+            val requestedFrames = (clippedDurationMs / frameDelayMs).toInt().coerceIn(6, 48)
+
+            encoder = WebPAnimEncoder(
+                context = reactApplicationContext,
+                width = STICKER_SIZE,
+                height = STICKER_SIZE,
+                options = WebPAnimEncoderOptions(
+                    allowMixed = false,
+                    minimizeSize = false,
+                    animParams = WebPMuxAnimParams(loopCount = 0),
+                ),
+            )
+            encoder.configure(
+                config = WebPConfig(
+                    lossless = WebPConfig.COMPRESSION_LOSSY,
+                    quality = options.quality,
+                    method = options.method,
+                    alphaCompression = WebPConfig.ALPHA_COMPRESSION_WITH_LOSSLESS,
+                ),
+                preset = WebPPreset.WEBP_PRESET_DRAWING,
+            )
+
+            var addedFrames = 0
+            for (i in 0 until requestedFrames) {
+                val frameTimeMs = (i * frameDelayMs).coerceAtMost(clippedDurationMs)
+                val progress = if (clippedDurationMs <= 0L) {
+                    0f
+                } else {
+                    (frameTimeMs.toFloat() / clippedDurationMs.toFloat()).coerceIn(0f, 1f)
+                }
+
+                val frameBitmap = renderTgsFrame(drawable, progress)
+                encoder.addFrame(addedFrames * frameDelayMs, frameBitmap)
+                frameBitmap.recycle()
+                addedFrames += 1
+            }
+
+            if (addedFrames < 6) {
+                throw IllegalStateException("Could not render enough frames for animated TGS sticker.")
+            }
+
+            val animationDurationMs = addedFrames * frameDelayMs
+            encoder.assemble(animationDurationMs, Uri.fromFile(outputFile))
+        } finally {
+            encoder?.release()
+        }
+    }
+
+    @ReactMethod
+    fun transcodeVideoSticker(
+        inputPathOrUri: String,
+        outputPathOrUri: String,
+        mode: String,
+        preset: String,
+        promise: Promise,
+    ) {
+        try {
+            val inputFile = resolveDirPath(inputPathOrUri)
+            if (!inputFile.exists()) {
+                promise.reject("E_INPUT_MISSING", "Input file does not exist: $inputPathOrUri")
+                return
+            }
+
+            val outputFile = resolveDirPath(outputPathOrUri)
+            outputFile.parentFile?.let { parent ->
+                if (!parent.exists()) {
+                    parent.mkdirs()
+                }
+            }
+            if (outputFile.exists()) {
+                outputFile.delete()
+            }
+
+            val options = transcodeOptionsForPreset(preset)
+            try {
+                transcodeVideoWithFfmpeg(inputFile, outputFile, mode, options)
+            } catch (ffmpegError: Exception) {
+                Log.w(
+                    "WhatsAppStickerModule",
+                    "FFmpeg video transcode failed, falling back to internal encoder: ${ffmpegError.message}",
+                )
+
+                when (mode.lowercase(Locale.US)) {
+                    "animated-webp" -> encodeAnimatedWebpFromVideo(inputFile, outputFile, options)
+                    "still-webp" -> encodeStillWebpFromVideo(inputFile, outputFile, options)
+                    else -> {
+                        promise.reject("E_TRANSCODE_MODE", "Unsupported transcode mode: $mode")
+                        return
+                    }
+                }
+            }
+
+            if (!outputFile.exists() || outputFile.length() <= 0L) {
+                promise.reject("E_TRANSCODE_FAILED", "Video transcode produced an empty output file.")
+                return
+            }
+
+            promise.resolve(outputFile.absolutePath)
+        } catch (e: Exception) {
+            promise.reject("E_TRANSCODE_FAILED", "Video transcode failed: ${e.message}")
+        }
+    }
+
+    @ReactMethod
+    fun generateTrayIcon(inputPathOrUri: String, outputPathOrUri: String, promise: Promise) {
+        try {
+            val inputFile = resolveDirPath(inputPathOrUri)
+            if (!inputFile.exists()) {
+                promise.reject("E_INPUT_MISSING", "Input file does not exist")
+                return
+            }
+
+            val outputFile = resolveDirPath(outputPathOrUri)
+            outputFile.parentFile?.let { parent ->
+                if (!parent.exists()) {
+                    parent.mkdirs()
+                }
+            }
+
+            val options = android.graphics.BitmapFactory.Options()
+            options.inPreferredConfig = Bitmap.Config.ARGB_8888
+            val sourceBitmap = android.graphics.BitmapFactory.decodeFile(inputFile.absolutePath, options)
+                ?: throw IllegalStateException("Could not decode WebP or Image for tray icon. Ensure file is a valid image.")
+
+            val destBitmap = Bitmap.createScaledBitmap(sourceBitmap, 96, 96, true)
+
+            java.io.FileOutputStream(outputFile).use { out ->
+                destBitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+            }
+
+            sourceBitmap.recycle()
+            destBitmap.recycle()
+
+            promise.resolve(outputFile.absolutePath)
+        } catch (e: Exception) {
+            promise.reject("E_TRAY_FAILED", "Failed to generate tray icon natively: ${e.message}")
+        }
+    }
+
+    @ReactMethod
+    fun transcodeTgsSticker(
+        inputPathOrUri: String,
+        outputPathOrUri: String,
+        mode: String,
+        preset: String,
+        promise: Promise,
+    ) {
+        try {
+            val inputFile = resolveDirPath(inputPathOrUri)
+            if (!inputFile.exists()) {
+                promise.reject("E_INPUT_MISSING", "Input file does not exist: $inputPathOrUri")
+                return
+            }
+
+            val outputFile = resolveDirPath(outputPathOrUri)
+            outputFile.parentFile?.let { parent ->
+                if (!parent.exists()) {
+                    parent.mkdirs()
+                }
+            }
+            if (outputFile.exists()) {
+                outputFile.delete()
+            }
+
+            val options = transcodeOptionsForPreset(preset)
+            when (mode.lowercase(Locale.US)) {
+                "animated-webp" -> encodeAnimatedWebpFromTgs(inputFile, outputFile, options)
+                "still-webp" -> encodeStillWebpFromTgs(inputFile, outputFile, options)
+                else -> {
+                    promise.reject("E_TRANSCODE_MODE", "Unsupported transcode mode: $mode")
+                    return
+                }
+            }
+
+            if (!outputFile.exists() || outputFile.length() <= 0L) {
+                promise.reject("E_TRANSCODE_FAILED", "TGS transcode produced an empty output file.")
+                return
+            }
+
+            promise.resolve(outputFile.absolutePath)
+        } catch (e: Exception) {
+            promise.reject("E_TRANSCODE_FAILED", "TGS transcode failed: ${e.message}")
+        }
     }
 
     private fun syncStickerAssets(sourceDirPathOrUri: String) {
@@ -203,6 +651,54 @@ class WhatsAppStickerModule(reactContext: ReactApplicationContext) :
         }
     }
 
+    private fun resolveSupportedTargets(activity: Activity): List<String> {
+        val baseIntent = Intent().apply {
+            action = "com.whatsapp.intent.action.ENABLE_STICKER_PACK"
+        }
+
+        return activity.packageManager
+            .queryIntentActivities(baseIntent, 0)
+            .map { it.activityInfo.packageName }
+            .distinct()
+    }
+
+    @ReactMethod
+    fun runBasicDiagnostics(promise: Promise) {
+        try {
+            val result = Arguments.createMap()
+            result.putString("providerAuthority", StickerContentProvider.AUTHORITY)
+
+            val activity = reactApplicationContext.currentActivity
+            result.putBoolean("hasForegroundActivity", activity != null)
+
+            if (activity != null) {
+                val targets = resolveSupportedTargets(activity)
+                val targetsArray = Arguments.createArray()
+                targets.forEach { targetsArray.pushString(it) }
+                result.putArray("supportedTargets", targetsArray)
+                result.putBoolean("whatsappInstalled", targets.isNotEmpty())
+
+                val whitelistChecks = Arguments.createMap()
+                whitelistChecks.putBoolean(
+                    "com.whatsapp",
+                    isWhitelisted("com.whatsapp.provider.sticker_whitelist_check", "diagnostics"),
+                )
+                whitelistChecks.putBoolean(
+                    "com.whatsapp.w4b",
+                    isWhitelisted("com.whatsapp.w4b.provider.sticker_whitelist_check", "diagnostics"),
+                )
+                result.putMap("whitelistProviderReachable", whitelistChecks)
+            } else {
+                result.putBoolean("whatsappInstalled", false)
+                result.putArray("supportedTargets", Arguments.createArray())
+            }
+
+            promise.resolve(result)
+        } catch (e: Exception) {
+            promise.reject("E_DIAGNOSTICS", "Failed to run diagnostics: ${e.message}")
+        }
+    }
+
     @ReactMethod
     fun sendStickerPack(destDir: String, identifier: String, packName: String, promise: Promise) {
         if (pendingPromise != null) {
@@ -219,18 +715,15 @@ class WhatsAppStickerModule(reactContext: ReactApplicationContext) :
                 return
             }
 
-            val baseIntent = Intent()
-            baseIntent.action = "com.whatsapp.intent.action.ENABLE_STICKER_PACK"
-
-            val resolveInfoList = activity.packageManager.queryIntentActivities(baseIntent, 0)
-            if (resolveInfoList.isEmpty()) {
+            val supportedTargets = resolveSupportedTargets(activity)
+            if (supportedTargets.isEmpty()) {
                 promise.reject("E_WHATSAPP_NOT_INSTALLED", "No supported version of WhatsApp is installed on this device.")
                 pendingPromise = null
                 return
             }
 
             // Prefer official ones if they exist, else just take the first one found
-            val targetPackage = resolveInfoList.map { it.activityInfo.packageName }.let { foundApps ->
+            val targetPackage = supportedTargets.let { foundApps ->
                 foundApps.firstOrNull { it == "com.whatsapp" }
                     ?: foundApps.firstOrNull { it == "com.whatsapp.w4b" }
                     ?: foundApps.first()
@@ -281,8 +774,36 @@ class WhatsAppStickerModule(reactContext: ReactApplicationContext) :
 
         val validationError = data?.getStringExtra("validation_error")
         if (!validationError.isNullOrBlank()) {
-            Log.e("WhatsAppStickerModule", "WhatsApp validation error: $validationError")
-            promise.reject("E_WHATSAPP_VALIDATION", validationError)
+            val extras = data.extras
+            val payload = if (extras != null && !extras.isEmpty) {
+                extras.keySet().joinToString("; ") { key ->
+                    val value = extras.get(key)
+                    "$key=$value"
+                }
+            } else {
+                ""
+            }
+            val finalMessage = if (payload.isBlank()) {
+                validationError
+            } else {
+                "$validationError ($payload)"
+            }
+            Log.e("WhatsAppStickerModule", "WhatsApp validation error: $finalMessage")
+            promise.reject("E_WHATSAPP_VALIDATION", finalMessage)
+            return
+        }
+
+        val extras = data?.extras
+        if (extras != null && !extras.isEmpty) {
+            val payload = extras.keySet().joinToString("; ") { key ->
+                val value = extras.get(key)
+                "$key=$value"
+            }
+            Log.e("WhatsAppStickerModule", "WhatsApp add flow failed with extras: $payload")
+            promise.reject(
+                "E_WHATSAPP_VALIDATION",
+                "WhatsApp rejected this sticker pack. Details: $payload",
+            )
             return
         }
 

@@ -8,7 +8,10 @@ export interface StoredPackRecord {
   supportedCount: number;
   packChunks: number;
   lastSelectedCount?: number;
+  lastSelectedChunkIndex?: number;
   exportedChunkIndexes?: number[];
+  isFavorite?: boolean;
+  isArchived?: boolean;
   coverUrl?: string; // Add cover image URL
   updatedAt: string;
 }
@@ -85,6 +88,42 @@ export async function upsertStoredPack(
   return normalizeRecords(records);
 }
 
+export async function updateStoredPack(
+  packName: string,
+  patch: Partial<Omit<StoredPackRecord, 'packName' | 'updatedAt'>>,
+  options?: { touchUpdatedAt?: boolean },
+): Promise<StoredPackRecord[]> {
+  const records = await readRawLibrary();
+  const index = records.findIndex(record => record.packName === packName);
+
+  if (index < 0) {
+    return normalizeRecords(records);
+  }
+
+  const current = records[index];
+  if (!current) {
+    return normalizeRecords(records);
+  }
+
+  records[index] = {
+    ...current,
+    ...patch,
+    updatedAt: options?.touchUpdatedAt === false
+      ? current.updatedAt
+      : new Date().toISOString(),
+  };
+
+  await writeRawLibrary(records);
+  return normalizeRecords(records);
+}
+
+export async function deleteStoredPack(packName: string): Promise<StoredPackRecord[]> {
+  const records = await readRawLibrary();
+  const nextRecords = records.filter(record => record.packName !== packName);
+  await writeRawLibrary(nextRecords);
+  return normalizeRecords(nextRecords);
+}
+
 export async function touchStoredPack(packName: string): Promise<StoredPackRecord[]> {
   const records = await readRawLibrary();
   const index = records.findIndex(record => record.packName === packName);
@@ -93,8 +132,13 @@ export async function touchStoredPack(packName: string): Promise<StoredPackRecor
     return normalizeRecords(records);
   }
 
+  const current = records[index];
+  if (!current) {
+    return normalizeRecords(records);
+  }
+
   records[index] = {
-    ...records[index],
+    ...current,
     updatedAt: new Date().toISOString(),
   };
 

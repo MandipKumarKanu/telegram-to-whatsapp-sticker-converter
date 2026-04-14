@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   View,
   Text,
@@ -6,7 +6,6 @@ import {
   TouchableOpacity,
   StyleSheet,
   ActivityIndicator,
-  Alert,
   KeyboardAvoidingView,
   Platform,
   ScrollView,
@@ -16,13 +15,16 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useNavigation } from "@react-navigation/native";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
-import { Feather, Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
+import { Feather, MaterialCommunityIcons } from "@expo/vector-icons";
 import {
+  deleteStoredPack,
   listStoredPacks,
   StoredPackRecord,
   touchStoredPack,
+  updateStoredPack,
   upsertStoredPack,
 } from "../services/packLibrary";
+import { extractTelegramPackName } from "../services/telegramPackName";
 import { TelegramApi } from "../services/telegramApi";
 
 const BOT_TOKEN = process.env.EXPO_PUBLIC_TELEGRAM_BOT_TOKEN;
@@ -30,14 +32,22 @@ const BOT_TOKEN = process.env.EXPO_PUBLIC_TELEGRAM_BOT_TOKEN;
 type RootStackParamList = {
   Home: undefined;
   Preview: { packName: string; initialCustomPackName?: string };
+  Diagnostics: undefined;
 };
 
 type NavigationProp = NativeStackNavigationProp<RootStackParamList, "Home">;
+type LibraryFilter = "active" | "favorites" | "archived";
+type LibrarySort = "recent" | "name" | "stickers";
 
 export default function HomeScreen() {
+  const isAndroid = Platform.OS === "android";
   const [url, setUrl] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [storedPacks, setStoredPacks] = useState<StoredPackRecord[]>([]);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [filterMode, setFilterMode] = useState<LibraryFilter>("active");
+  const [sortMode, setSortMode] = useState<LibrarySort>("recent");
+  const [showAllPacks, setShowAllPacks] = useState(false);
   const navigation = useNavigation<NavigationProp>();
 
   // Custom Dialog State
@@ -70,7 +80,9 @@ export default function HomeScreen() {
       try {
         const records = await listStoredPacks();
         if (!cancelled) setStoredPacks(records);
-      } catch (error) {}
+      } catch (error) {
+        console.warn("Failed to load stored sticker packs", error);
+      }
     };
     loadLibrary();
     return () => {
@@ -78,19 +90,61 @@ export default function HomeScreen() {
     };
   }, []);
 
-  const totalPacks = storedPacks.length;
-  const totalStickers = storedPacks.reduce(
+  const activePacks = useMemo(
+    () => storedPacks.filter((record) => !record.isArchived),
+    [storedPacks],
+  );
+  const totalPacks = activePacks.length;
+  const totalStickers = activePacks.reduce(
     (sum, r) => sum + r.supportedCount,
     0,
   );
 
-  const extractPackName = (input: string) => {
-    const regex = /(?:addstickers\/|stickers\/|^)([a-zA-Z0-9_]+)$/;
-    const match = input.match(regex);
-    return match ? match[1] : input.trim();
-  };
+  const managedPacks = useMemo(() => {
+    const search = searchQuery.trim().toLowerCase();
 
-  const handleFetchPack = async () => {
+    let next = [...storedPacks];
+    if (filterMode === "active") {
+      next = next.filter((record) => !record.isArchived);
+    } else if (filterMode === "favorites") {
+      next = next.filter((record) => record.isFavorite && !record.isArchived);
+    } else {
+      next = next.filter((record) => record.isArchived);
+    }
+
+    if (search) {
+      next = next.filter((record) => {
+        const haystack =
+          `${record.customPackName || ""} ${record.title || ""} ${record.packName}`.toLowerCase();
+        return haystack.includes(search);
+      });
+    }
+
+    if (sortMode === "name") {
+      next.sort((a, b) => {
+        const aName = (a.customPackName || a.title || a.packName).toLowerCase();
+        const bName = (b.customPackName || b.title || b.packName).toLowerCase();
+        return aName.localeCompare(bName);
+      });
+    } else if (sortMode === "stickers") {
+      next.sort((a, b) => b.supportedCount - a.supportedCount);
+    } else {
+      next.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    }
+
+    return next;
+  }, [filterMode, searchQuery, sortMode, storedPacks]);
+
+  const visiblePacks = showAllPacks ? managedPacks : managedPacks.slice(0, 5);
+
+  const handleFetchPack = async (forceReanalyze = false) => {
+    if (Platform.OS !== "android") {
+      return showCustomDialog(
+        "Android Only",
+        "Sticker export is only supported on Android for this app.",
+      );
+    }
+
     if (!url)
       return showCustomDialog(
         "Error",
@@ -98,9 +152,36 @@ export default function HomeScreen() {
       );
     if (!BOT_TOKEN)
       return showCustomDialog("Configuration Error", "Please set BOT_TOKEN.");
-    const packName = extractPackName(url);
+    const packName = extractTelegramPackName(url);
     if (!packName)
-      return showCustomDialog("Error", "Could not extract pack name.");
+      return showCustomDialog(
+        "Error",
+        "Could not parse sticker pack name. Use a link like https://t.me/addstickers/PackName or enter PackName directly.",
+      );
+
+    const existingPack = storedPacks.find(
+      (record) => record.packName === packName,
+    );
+    if (existingPack && !forceReanalyze) {
+      return showCustomDialog(
+        "Pack already exists",
+        "This pack is already in your library. Open existing pack or re-analyze from Telegram?",
+        [
+          // {
+          //   text: "Open Existing",
+          //   onPress: () =>
+          //     openPack(existingPack.packName, existingPack.customPackName),
+          // },
+          {
+            text: "Open",
+            onPress: () => {
+              handleFetchPack(true);
+            },
+          },
+          { text: "Cancel" },
+        ],
+      );
+    }
 
     setIsLoading(true);
     try {
@@ -120,6 +201,9 @@ export default function HomeScreen() {
       let coverUrl = existing?.coverUrl;
       if (!coverUrl) {
         const firstSticker = supportedStickers[0];
+        if (!firstSticker) {
+          throw new Error("No sticker data available for cover image.");
+        }
         const fileId =
           firstSticker.is_animated || firstSticker.is_video
             ? firstSticker.thumbnail?.file_id
@@ -136,6 +220,11 @@ export default function HomeScreen() {
         totalCount: setInfo.stickers.length,
         supportedCount: supportedStickers.length,
         packChunks: Math.ceil(supportedStickers.length / 30),
+        lastSelectedCount: existing?.lastSelectedCount,
+        lastSelectedChunkIndex: existing?.lastSelectedChunkIndex,
+        exportedChunkIndexes: existing?.exportedChunkIndexes,
+        isFavorite: existing?.isFavorite,
+        isArchived: existing?.isArchived,
         coverUrl,
       });
       setStoredPacks(nextRecords);
@@ -152,12 +241,60 @@ export default function HomeScreen() {
     try {
       const nextRecords = await touchStoredPack(packName);
       setStoredPacks(nextRecords);
-    } catch (error) {}
+    } catch (error) {
+      console.warn("Failed to update last-accessed timestamp", error);
+    }
 
     navigation.navigate("Preview", {
       packName,
       initialCustomPackName: initialCustomName,
     });
+  };
+
+  const handleToggleFavorite = async (record: StoredPackRecord) => {
+    try {
+      const nextRecords = await updateStoredPack(record.packName, {
+        isFavorite: !record.isFavorite,
+      });
+      setStoredPacks(nextRecords);
+    } catch (error) {
+      console.warn("Failed to update favorite state", error);
+      showCustomDialog("Error", "Could not update favorite state.");
+    }
+  };
+
+  const handleToggleArchive = async (record: StoredPackRecord) => {
+    try {
+      const nextRecords = await updateStoredPack(record.packName, {
+        isArchived: !record.isArchived,
+      });
+      setStoredPacks(nextRecords);
+    } catch (error) {
+      console.warn("Failed to update archive state", error);
+      showCustomDialog("Error", "Could not update archive state.");
+    }
+  };
+
+  const handleDeletePack = (record: StoredPackRecord) => {
+    showCustomDialog(
+      "Delete Pack",
+      `Delete ${record.customPackName || record.title || record.packName} from library? This does not remove stickers from WhatsApp.`,
+      [
+        { text: "Cancel" },
+        {
+          text: "Delete",
+          onPress: async () => {
+            try {
+              const nextRecords = await deleteStoredPack(record.packName);
+              setStoredPacks(nextRecords);
+            } catch (error) {
+              console.warn("Failed to delete pack", error);
+              showCustomDialog("Error", "Could not delete this pack.");
+            }
+          },
+        },
+      ],
+    );
   };
 
   const getRelativeTime = (isoString?: string) => {
@@ -207,9 +344,7 @@ export default function HomeScreen() {
             <View style={styles.statsRow}>
               <View style={styles.statPill}>
                 <Feather name="box" size={14} color="#34D399" />
-                <Text style={styles.statPillText}>
-                  {totalPacks || 24} Packs
-                </Text>
+                <Text style={styles.statPillText}>{totalPacks} Packs</Text>
               </View>
               <View style={styles.statPill}>
                 <MaterialCommunityIcons
@@ -218,10 +353,19 @@ export default function HomeScreen() {
                   color="#34D399"
                 />
                 <Text style={styles.statPillText}>
-                  {totalStickers || 384} Stickers
+                  {totalStickers} Stickers
                 </Text>
               </View>
             </View>
+
+            {Platform.OS !== "android" && (
+              <View style={styles.platformWarning}>
+                <Feather name="alert-circle" size={14} color="#FBBF24" />
+                <Text style={styles.platformWarningText}>
+                  Android only: WhatsApp sticker export is not available on iOS.
+                </Text>
+              </View>
+            )}
           </View>
 
           {/* Convert Card */}
@@ -262,10 +406,12 @@ export default function HomeScreen() {
             <TouchableOpacity
               style={[
                 styles.primaryButton,
-                (!url || !url.trim()) && { opacity: 0.5 },
+                (!url || !url.trim() || !isAndroid) && { opacity: 0.5 },
               ]}
-              onPress={handleFetchPack}
-              disabled={isLoading || !url || !url.trim()}
+              onPress={() => {
+                void handleFetchPack();
+              }}
+              disabled={isLoading || !url || !url.trim() || !isAndroid}
             >
               {isLoading ? (
                 <ActivityIndicator color="#000" />
@@ -284,7 +430,7 @@ export default function HomeScreen() {
                     style={{ marginRight: 8 }}
                   />
                   <Text style={styles.primaryButtonText}>
-                    Analyze & Convert
+                    {isAndroid ? "Analyze & Convert" : "Android Only"}
                   </Text>
                 </View>
               )}
@@ -294,13 +440,141 @@ export default function HomeScreen() {
           {/* Created Packs Header */}
           <View style={styles.sectionTitleRow}>
             <Text style={styles.sectionTitle}>Created Packs</Text>
-            <TouchableOpacity>
-              <Text style={styles.viewAllText}>VIEW ALL</Text>
+            <TouchableOpacity
+              onPress={() => setShowAllPacks((prev) => !prev)}
+              disabled={managedPacks.length <= 5}
+            >
+              <Text style={styles.viewAllText}>
+                {managedPacks.length <= 5
+                  ? "ALL SHOWN"
+                  : showAllPacks
+                    ? "SHOW LESS"
+                    : "VIEW ALL"}
+              </Text>
+            </TouchableOpacity>
+          </View>
+
+          <View style={styles.searchContainer}>
+            <Feather name="search" size={14} color="#718096" />
+            <TextInput
+              style={styles.searchInput}
+              value={searchQuery}
+              onChangeText={setSearchQuery}
+              placeholder="Search packs"
+              placeholderTextColor="#718096"
+            />
+          </View>
+
+          <View style={styles.controlRow}>
+            <TouchableOpacity
+              style={[
+                styles.controlChip,
+                filterMode === "active" && styles.controlChipActive,
+              ]}
+              onPress={() => setFilterMode("active")}
+            >
+              <Text
+                style={[
+                  styles.controlChipText,
+                  filterMode === "active" && styles.controlChipTextActive,
+                ]}
+              >
+                ACTIVE
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.controlChip,
+                filterMode === "favorites" && styles.controlChipActive,
+              ]}
+              onPress={() => setFilterMode("favorites")}
+            >
+              <Text
+                style={[
+                  styles.controlChipText,
+                  filterMode === "favorites" && styles.controlChipTextActive,
+                ]}
+              >
+                FAVORITES
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.controlChip,
+                filterMode === "archived" && styles.controlChipActive,
+              ]}
+              onPress={() => setFilterMode("archived")}
+            >
+              <Text
+                style={[
+                  styles.controlChipText,
+                  filterMode === "archived" && styles.controlChipTextActive,
+                ]}
+              >
+                ARCHIVED
+              </Text>
+            </TouchableOpacity>
+          </View>
+
+          <View style={styles.controlRow}>
+            <TouchableOpacity
+              style={[
+                styles.controlChip,
+                sortMode === "recent" && styles.controlChipActive,
+              ]}
+              onPress={() => setSortMode("recent")}
+            >
+              <Text
+                style={[
+                  styles.controlChipText,
+                  sortMode === "recent" && styles.controlChipTextActive,
+                ]}
+              >
+                RECENT
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.controlChip,
+                sortMode === "name" && styles.controlChipActive,
+              ]}
+              onPress={() => setSortMode("name")}
+            >
+              <Text
+                style={[
+                  styles.controlChipText,
+                  sortMode === "name" && styles.controlChipTextActive,
+                ]}
+              >
+                NAME
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.controlChip,
+                sortMode === "stickers" && styles.controlChipActive,
+              ]}
+              onPress={() => setSortMode("stickers")}
+            >
+              <Text
+                style={[
+                  styles.controlChipText,
+                  sortMode === "stickers" && styles.controlChipTextActive,
+                ]}
+              >
+                STICKERS
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.controlChip}
+              onPress={() => navigation.navigate("Diagnostics")}
+            >
+              <Text style={styles.controlChipText}>DIAGNOSTICS</Text>
             </TouchableOpacity>
           </View>
 
           {/* Packs List */}
-          {storedPacks.map((record, index) => (
+          {visiblePacks.map((record) => (
             <TouchableOpacity
               key={record.packName}
               style={styles.packCard}
@@ -355,6 +629,55 @@ export default function HomeScreen() {
                   </View>
                 </View>
 
+                <View style={styles.packManageRow}>
+                  <TouchableOpacity
+                    style={styles.packManageButton}
+                    onPress={(event) => {
+                      event.stopPropagation();
+                      handleToggleFavorite(record);
+                    }}
+                  >
+                    <MaterialCommunityIcons
+                      name={record.isFavorite ? "star" : "star-outline"}
+                      size={14}
+                      color="#FBBF24"
+                    />
+                    <Text style={styles.packManageText}>
+                      {record.isFavorite ? "FAVORITE" : "FAVORITE"}
+                    </Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={styles.packManageButton}
+                    onPress={(event) => {
+                      event.stopPropagation();
+                      handleToggleArchive(record);
+                    }}
+                  >
+                    <Feather
+                      name={record.isArchived ? "rotate-ccw" : "archive"}
+                      size={14}
+                      color="#718096"
+                    />
+                    <Text style={styles.packManageText}>
+                      {record.isArchived ? "UNARCHIVE" : "ARCHIVE"}
+                    </Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={styles.packManageButton}
+                    onPress={(event) => {
+                      event.stopPropagation();
+                      handleDeletePack(record);
+                    }}
+                  >
+                    <Feather name="trash-2" size={14} color="#FB7185" />
+                    <Text style={[styles.packManageText, { color: "#FB7185" }]}>
+                      DELETE
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+
                 <View style={styles.openButton}>
                   <Text style={styles.openButtonText}>Open Stickers</Text>
                   <Feather
@@ -367,6 +690,15 @@ export default function HomeScreen() {
               </View>
             </TouchableOpacity>
           ))}
+
+          {visiblePacks.length === 0 && (
+            <View style={styles.emptyStateCard}>
+              <Feather name="inbox" size={20} color="#718096" />
+              <Text style={styles.emptyStateText}>
+                No packs match current filters.
+              </Text>
+            </View>
+          )}
 
           <View style={{ height: 40 }} />
         </ScrollView>
@@ -442,6 +774,23 @@ const styles = StyleSheet.create({
   },
   subTitle: { color: "#A0AEC0", fontSize: 15, marginBottom: 16 },
   statsRow: { flexDirection: "row", gap: 12 },
+  platformWarning: {
+    marginTop: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "rgba(251, 191, 36, 0.12)",
+    borderWidth: 1,
+    borderColor: "rgba(251, 191, 36, 0.35)",
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  platformWarningText: {
+    color: "#FDE68A",
+    fontSize: 12,
+    marginLeft: 8,
+    flex: 1,
+  },
   statPill: {
     flexDirection: "row",
     alignItems: "center",
@@ -516,6 +865,50 @@ const styles = StyleSheet.create({
     fontWeight: "bold",
     letterSpacing: 1,
   },
+  searchContainer: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#13151D",
+    borderWidth: 1,
+    borderColor: "#1A1D2D",
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    marginBottom: 12,
+    height: 44,
+  },
+  searchInput: {
+    flex: 1,
+    color: "#FFF",
+    fontSize: 14,
+    marginLeft: 8,
+  },
+  controlRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    marginBottom: 12,
+    gap: 8,
+  },
+  controlChip: {
+    borderWidth: 1,
+    borderColor: "#2A3148",
+    backgroundColor: "#141925",
+    borderRadius: 14,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  controlChipActive: {
+    backgroundColor: "rgba(52, 211, 153, 0.15)",
+    borderColor: "rgba(52, 211, 153, 0.45)",
+  },
+  controlChipText: {
+    color: "#A0AEC0",
+    fontSize: 11,
+    fontWeight: "700",
+    letterSpacing: 0.5,
+  },
+  controlChipTextActive: {
+    color: "#34D399",
+  },
   packCard: {
     backgroundColor: "#13151D",
     borderRadius: 20,
@@ -563,6 +956,29 @@ const styles = StyleSheet.create({
   packStatsRow: { flexDirection: "row", marginBottom: 16 },
   packStatItem: { flexDirection: "row", alignItems: "center", marginRight: 16 },
   packStatText: { color: "#A0AEC0", fontSize: 13, marginLeft: 6 },
+  packManageRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    marginBottom: 12,
+    gap: 8,
+  },
+  packManageButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#171D2B",
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#212A3D",
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+  },
+  packManageText: {
+    color: "#A0AEC0",
+    fontSize: 10,
+    fontWeight: "700",
+    marginLeft: 6,
+    letterSpacing: 0.4,
+  },
   openButton: {
     flexDirection: "row",
     backgroundColor: "rgba(255, 138, 101, 0.1)",
@@ -574,6 +990,20 @@ const styles = StyleSheet.create({
     borderColor: "rgba(255, 138, 101, 0.2)",
   },
   openButtonText: { color: "#FF8A65", fontSize: 15, fontWeight: "600" },
+  emptyStateCard: {
+    borderWidth: 1,
+    borderColor: "#1E2335",
+    backgroundColor: "#13151D",
+    borderRadius: 14,
+    padding: 16,
+    alignItems: "center",
+    marginTop: 4,
+  },
+  emptyStateText: {
+    color: "#718096",
+    fontSize: 13,
+    marginTop: 8,
+  },
   fab: {
     position: "absolute",
     bottom: 90,

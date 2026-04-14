@@ -1,5 +1,7 @@
 import * as FileSystem from 'expo-file-system/legacy';
 import * as ImageManipulator from 'expo-image-manipulator';
+import WhatsAppStickerModule from '../native/WhatsAppStickerModule';
+import { buildContentsJsonPayload } from './stickerPackContents';
 
 export interface StickerConversionResult {
   uri: string; // The local file system URI of the converted generated webp
@@ -18,12 +20,31 @@ export interface StickerMetadata {
   accessibilityText?: string;
 }
 
+export type StickerQualityPreset = 'fast' | 'small' | 'best';
+
 const STICKER_SIZE = 512;
 const TRAY_ICON_SIZE = 96;
-const STICKER_MAX_BYTES = 100000;
+export const STICKER_MAX_BYTES = 100000;
+export const ANIMATED_STICKER_MAX_BYTES = 500000;
 const TRAY_ICON_MAX_BYTES = 50000;
 
 export class StickerConverter {
+
+  private toFileUri(pathOrUri: string): string {
+    if (pathOrUri.startsWith('file://')) {
+      return pathOrUri;
+    }
+    return `file://${pathOrUri}`;
+  }
+
+  private async ensureStickerSize(outputUri: string, maxBytes: number, errorLabel: string): Promise<number> {
+    const info = await FileSystem.getInfoAsync(outputUri);
+    const fileSize = info.exists && typeof info.size === 'number' ? info.size : Number.MAX_SAFE_INTEGER;
+    if (!info.exists || !info.size || fileSize <= 0 || fileSize > maxBytes) {
+      throw new Error(`${errorLabel} exceeds WhatsApp size limit (${fileSize} bytes).`);
+    }
+    return fileSize;
+  }
   
   // Create a temporary directory for raw downloads
   private async getRawDir() {
@@ -48,16 +69,35 @@ export class StickerConverter {
     }
   }
 
-  // Converts a downloaded image to exactly 512x512 WebP (< 100KB is usually achieved with normal compression, but we can lower quality if needed)
-  async convertToWhatsAppSticker(sourceUri: string, index: number): Promise<StickerConversionResult> {
-    const attempts = [
-      { size: STICKER_SIZE, quality: 0.85 },
-      { size: STICKER_SIZE, quality: 0.7 },
-      { size: STICKER_SIZE, quality: 0.55 },
-      { size: STICKER_SIZE, quality: 0.4 },
-      { size: STICKER_SIZE, quality: 0.3 },
-      { size: STICKER_SIZE, quality: 0.25 },
-    ];
+  // Converts a downloaded image to exactly 512x512 WebP with a quality preset.
+  async convertToWhatsAppSticker(
+    sourceUri: string,
+    index: number,
+    preset: StickerQualityPreset = 'best',
+  ): Promise<StickerConversionResult> {
+    const attemptsByPreset: Record<StickerQualityPreset, { size: number; quality: number }[]> = {
+      fast: [
+        { size: STICKER_SIZE, quality: 0.7 },
+        { size: STICKER_SIZE, quality: 0.55 },
+        { size: STICKER_SIZE, quality: 0.4 },
+      ],
+      small: [
+        { size: STICKER_SIZE, quality: 0.55 },
+        { size: STICKER_SIZE, quality: 0.4 },
+        { size: STICKER_SIZE, quality: 0.3 },
+        { size: STICKER_SIZE, quality: 0.25 },
+        { size: STICKER_SIZE, quality: 0.2 },
+      ],
+      best: [
+        { size: STICKER_SIZE, quality: 0.9 },
+        { size: STICKER_SIZE, quality: 0.8 },
+        { size: STICKER_SIZE, quality: 0.7 },
+        { size: STICKER_SIZE, quality: 0.55 },
+        { size: STICKER_SIZE, quality: 0.4 },
+      ],
+    };
+
+    const attempts = attemptsByPreset[preset];
 
     let smallestBytes = Number.MAX_SAFE_INTEGER;
 
@@ -85,39 +125,130 @@ export class StickerConverter {
     throw new Error(`Sticker ${index} is too large for WhatsApp after conversion (${smallestBytes} bytes).`);
   }
 
+  async convertVideoToAnimatedSticker(
+    sourceUri: string,
+    index: number,
+    preset: StickerQualityPreset = 'best',
+  ): Promise<StickerConversionResult> {
+    const rawDir = await this.getRawDir();
+    const outputPath = `${rawDir}${index}_animated.webp`;
+
+    const nativeOutputPath = await WhatsAppStickerModule.transcodeVideoSticker(
+      sourceUri,
+      outputPath,
+      'animated-webp',
+      preset,
+    );
+
+    const outputUri = this.toFileUri(nativeOutputPath);
+    await this.ensureStickerSize(outputUri, ANIMATED_STICKER_MAX_BYTES, `Animated sticker ${index}`);
+
+    return {
+      uri: outputUri,
+      fileName: `${index}.webp`,
+    };
+  }
+
+  async convertVideoToStillSticker(
+    sourceUri: string,
+    index: number,
+    preset: StickerQualityPreset = 'best',
+  ): Promise<StickerConversionResult> {
+    const rawDir = await this.getRawDir();
+    const outputPath = `${rawDir}${index}_still.webp`;
+
+    const nativeOutputPath = await WhatsAppStickerModule.transcodeVideoSticker(
+      sourceUri,
+      outputPath,
+      'still-webp',
+      preset,
+    );
+
+    const outputUri = this.toFileUri(nativeOutputPath);
+    await this.ensureStickerSize(outputUri, STICKER_MAX_BYTES, `Video sticker fallback ${index}`);
+
+    return {
+      uri: outputUri,
+      fileName: `${index}.webp`,
+    };
+  }
+
+  async convertTgsToAnimatedSticker(
+    sourceUri: string,
+    index: number,
+    preset: StickerQualityPreset = 'best',
+  ): Promise<StickerConversionResult> {
+    const rawDir = await this.getRawDir();
+    const outputPath = `${rawDir}${index}_tgs_animated.webp`;
+
+    const nativeOutputPath = await WhatsAppStickerModule.transcodeTgsSticker(
+      sourceUri,
+      outputPath,
+      'animated-webp',
+      preset,
+    );
+
+    const outputUri = this.toFileUri(nativeOutputPath);
+    await this.ensureStickerSize(outputUri, ANIMATED_STICKER_MAX_BYTES, `Animated TGS sticker ${index}`);
+
+    return {
+      uri: outputUri,
+      fileName: `${index}.webp`,
+    };
+  }
+
+  async convertTgsToStillSticker(
+    sourceUri: string,
+    index: number,
+    preset: StickerQualityPreset = 'best',
+  ): Promise<StickerConversionResult> {
+    const rawDir = await this.getRawDir();
+    const outputPath = `${rawDir}${index}_tgs_still.webp`;
+
+    const nativeOutputPath = await WhatsAppStickerModule.transcodeTgsSticker(
+      sourceUri,
+      outputPath,
+      'still-webp',
+      preset,
+    );
+
+    const outputUri = this.toFileUri(nativeOutputPath);
+    await this.ensureStickerSize(outputUri, STICKER_MAX_BYTES, `TGS fallback sticker ${index}`);
+
+    return {
+      uri: outputUri,
+      fileName: `${index}.webp`,
+    };
+  }
+
   // Create tray icon (96x96, <50KB)
   async createTrayIcon(sourceUri: string): Promise<StickerConversionResult> {
-    const traySizes = [TRAY_ICON_SIZE];
-    let smallestBytes = Number.MAX_SAFE_INTEGER;
+    const rawDir = await this.getRawDir();
+    const outputPath = `${rawDir}tray_icon_temp.png`;
 
-    for (const size of traySizes) {
-      const attempt = await ImageManipulator.manipulateAsync(
+    try {
+      const nativeOutputPath = await WhatsAppStickerModule.generateTrayIcon(
         sourceUri,
-        [{ resize: { width: size, height: size } }],
-        { compress: 1, format: ImageManipulator.SaveFormat.PNG }
+        outputPath
       );
 
-      const info = await FileSystem.getInfoAsync(attempt.uri);
-      const fileSize = info.exists && typeof info.size === 'number' ? info.size : Number.MAX_SAFE_INTEGER;
-      if (fileSize < smallestBytes) {
-        smallestBytes = fileSize;
-      }
+      const outputUri = this.toFileUri(nativeOutputPath);
+      await this.ensureStickerSize(outputUri, 50000, `Tray icon`);
 
-      if (info.exists && info.size && info.size <= TRAY_ICON_MAX_BYTES) {
-        return {
-          uri: attempt.uri,
-          fileName: 'tray_icon.png',
-        };
-      }
+      return {
+        uri: outputUri,
+        fileName: 'tray_icon.png',
+      };
+    } catch (e: any) {
+      throw new Error(`Failed to generate tray icon natively: ${e.message}`);
     }
-
-    throw new Error(`Tray icon is too large for WhatsApp after conversion (${smallestBytes} bytes).`);
   }
 
   // Download a single file using expo file system
-  async downloadFile(url: string, fileId: string): Promise<string> {
+  async downloadFile(url: string, fileId: string, extension = 'webp'): Promise<string> {
     const rawDir = await this.getRawDir();
-    const destination = `${rawDir}${fileId}.webp`; // telegram static stickers are webp
+    const safeExt = extension.replace(/[^a-z0-9]/gi, '').toLowerCase() || 'bin';
+    const destination = `${rawDir}${fileId}.${safeExt}`;
     
     const { uri } = await FileSystem.downloadAsync(url, destination);
     return uri;
@@ -128,38 +259,17 @@ export class StickerConverter {
     packName: string, 
     trayIconFile: string, 
     stickers: StickerMetadata[],
-    imageDataVersion: string
+    imageDataVersion: string,
+    animatedStickerPack = false,
   ) {
-    const contentsObj = {
-      image_data_version: imageDataVersion,
-      android_play_store_link: "",
-      ios_app_store_link: "",
-      ios_app_download_link: "",
-      sticker_packs: [
-        {
-          identifier: packId,
-          name: packName,
-          publisher: "StickerBridge By Mandy",
-          tray_image_file: trayIconFile,
-          publisher_email: "mandipshah3@gmail.com",
-          publisher_website: "https://mandipkk.com.np",
-          privacy_policy_website: "https://mandipkk.com.np",
-          license_agreement_website: "https://mandipkk.com.np",
-          image_data_version: imageDataVersion,
-          avoid_cache: false,
-          animated_sticker_pack: false,
-          stickers: stickers.map(sticker => {
-            const normalizedEmojis = sticker.emojis.filter(emoji => Boolean(emoji && emoji.trim())).slice(0, 3);
-
-            return {
-              image_file: sticker.fileName,
-              emojis: normalizedEmojis.length ? normalizedEmojis : ['🙂'],
-              ...(sticker.accessibilityText ? { accessibility_text: sticker.accessibilityText } : {}),
-            };
-          })
-        }
-      ]
-    };
+    const contentsObj = buildContentsJsonPayload({
+      packId,
+      packName,
+      trayIconFile,
+      stickers,
+      imageDataVersion,
+      animatedStickerPack,
+    });
 
     const dest = `${FileSystem.documentDirectory}contents.json`;
     await FileSystem.writeAsStringAsync(dest, JSON.stringify(contentsObj, null, 2));
